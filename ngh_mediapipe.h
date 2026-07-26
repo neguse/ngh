@@ -33,6 +33,7 @@
 #ifndef NGH_MEDIAPIPE_H_INCLUDED
 #define NGH_MEDIAPIPE_H_INCLUDED
 
+#include <math.h> /* sqrtf in the coordinate helpers; may need -lm if used */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -147,6 +148,118 @@ NGH_INLINE ngh_image ngh_image_rgb(const uint8_t *pixels, int width, int height,
     ngh_image img = ngh_image_rgba(pixels, width, height, stride);
     img.format = NGH_PIXFMT_RGB8;
     return img;
+}
+
+/* --------------------------------------------------- coordinate helpers --
+ *
+ * MediaPipe's three outputs live in three different spaces:
+ *
+ *   normalized landmarks   x,y in [0,1], origin top-left, y down. z is a
+ *                          pseudo-depth on roughly the same scale as x
+ *                          (width-normalized); more negative = closer.
+ *   pose world landmarks   metres, origin at the hip centre. x right,
+ *                          y DOWN, +z away from the camera.
+ *   face transform matrix  column-major TRS in MediaPipe's metric space:
+ *                          right-handed, y UP, camera at the origin looking
+ *                          down -z, in CENTIMETRES.
+ *
+ * (All of this is verified against MediaPipe's own golden data in
+ * tests/test_space.c -- little of it is documented upstream.)
+ *
+ * The helpers below convert each into one place, the "ngh camera space":
+ * right-handed, +x right, +y up, camera at the origin looking down -z,
+ * metres. Map that into your engine with a single transform of your own;
+ * which way you mirror, scale and smooth is your call, not ngh's. */
+
+/* Splits the facial transformation matrix into position (metres, ngh camera
+ * space), a unit quaternion (x, y, z, w) and a uniform scale. Identity
+ * rotation is a frontal face looking straight at the camera; +y is up through
+ * the head, +z points out of the face. Scale is the face size relative to
+ * MediaPipe's canonical face model -- the current pipeline absorbs it
+ * upstream, so expect 1.0.
+ *
+ * Upstream caveat: the matrix orientation degrades when the face is far from
+ * the image centre (mediapipe issue #4759); parity with MediaPipe is the
+ * ceiling here. */
+NGH_INLINE int ngh_face_transform_decompose(const float m[16],
+                                            float position[3],
+                                            float quaternion[4],
+                                            float *scale) {
+    float r[9]; /* row-major rotation, scale divided out */
+    float s, trace;
+    int col;
+    if (!m || !position || !quaternion) return NGH_ERR_INVALID_ARG;
+
+    s = 0.0f;
+    for (col = 0; col < 3; ++col) {
+        s += sqrtf(m[col * 4 + 0] * m[col * 4 + 0] +
+                   m[col * 4 + 1] * m[col * 4 + 1] +
+                   m[col * 4 + 2] * m[col * 4 + 2]);
+    }
+    s /= 3.0f;
+    if (!(s > 1e-6f)) return NGH_ERR_INVALID_ARG;
+
+    for (col = 0; col < 3; ++col) {
+        r[0 * 3 + col] = m[col * 4 + 0] / s;
+        r[1 * 3 + col] = m[col * 4 + 1] / s;
+        r[2 * 3 + col] = m[col * 4 + 2] / s;
+    }
+
+    /* Shepperd's method, branching on the dominant diagonal term. */
+    trace = r[0] + r[4] + r[8];
+    if (trace > 0.0f) {
+        float k = sqrtf(trace + 1.0f) * 2.0f;
+        quaternion[3] = 0.25f * k;
+        quaternion[0] = (r[7] - r[5]) / k;
+        quaternion[1] = (r[2] - r[6]) / k;
+        quaternion[2] = (r[3] - r[1]) / k;
+    } else if (r[0] > r[4] && r[0] > r[8]) {
+        float k = sqrtf(1.0f + r[0] - r[4] - r[8]) * 2.0f;
+        quaternion[3] = (r[7] - r[5]) / k;
+        quaternion[0] = 0.25f * k;
+        quaternion[1] = (r[1] + r[3]) / k;
+        quaternion[2] = (r[2] + r[6]) / k;
+    } else if (r[4] > r[8]) {
+        float k = sqrtf(1.0f + r[4] - r[0] - r[8]) * 2.0f;
+        quaternion[3] = (r[2] - r[6]) / k;
+        quaternion[0] = (r[1] + r[3]) / k;
+        quaternion[1] = 0.25f * k;
+        quaternion[2] = (r[5] + r[7]) / k;
+    } else {
+        float k = sqrtf(1.0f + r[8] - r[0] - r[4]) * 2.0f;
+        quaternion[3] = (r[3] - r[1]) / k;
+        quaternion[0] = (r[2] + r[6]) / k;
+        quaternion[1] = (r[5] + r[7]) / k;
+        quaternion[2] = 0.25f * k;
+    }
+
+    position[0] = m[12] * 0.01f; /* the axes already match; only cm -> m */
+    position[1] = m[13] * 0.01f;
+    position[2] = m[14] * 0.01f;
+    if (scale) *scale = s;
+    return NGH_OK;
+}
+
+/* Pose world landmark -> ngh camera-space orientation. The origin stays at
+ * the hip centre (MediaPipe provides no camera-relative translation for
+ * pose), so this orients the skeleton, it does not place it. */
+NGH_INLINE void ngh_pose_world_to_camera(const float world[3], float out[3]) {
+    out[0] = world[0];  /* right stays right          */
+    out[1] = -world[1]; /* down -> up                 */
+    out[2] = -world[2]; /* away -> toward the viewer  */
+}
+
+/* Normalized landmark -> a dimensionless view-space point with the image
+ * height spanning 1.0 and square pixels (x and z carry the aspect ratio).
+ * Pseudo-3D: good for overlays and effects, not metric. */
+NGH_INLINE void ngh_landmark_to_view(float x, float y, float z,
+                                     int image_width, int image_height,
+                                     float out[3]) {
+    float aspect =
+        image_height > 0 ? (float)image_width / (float)image_height : 1.0f;
+    out[0] = (x - 0.5f) * aspect;
+    out[1] = 0.5f - y;
+    out[2] = -z * aspect;
 }
 
 /* -------------------------------------------------------------------- face */

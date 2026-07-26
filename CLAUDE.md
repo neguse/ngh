@@ -37,6 +37,13 @@ Recorded so they don't get relitigated. Change only with a stated reason.
 - On the web, never route camera frames through SDL's camera backend (per-frame
   `getImageData` readback); pass the `<video>` element via
   `ngh_web_source_from_selector()`.
+- 3D decode belongs to ngh, scene mapping to the consumer. ngh's documented
+  target is the "ngh camera space" (right-handed, y-up, -z forward, metres);
+  helpers convert each MediaPipe output into it. Verified conventions
+  (tests/test_space.c): face metric space is y-up/-z-forward in CENTIMETRES
+  with scale absorbed upstream (always ~1.0); pose world is y-DOWN/+z-away
+  metres at the hip origin; normalized z is width-scaled, negative = closer.
+  ngh does not do mirroring, smoothing or retargeting -- consumer's call.
 - `vendor/` is fetched by `scripts/fetch_*.py`, never committed. Third-party
   notice obligations are in `THIRDPARTY.md` — the MediaPipe wheel's LICENSE
   does not carry the notices for its statically linked BSD/zlib dependencies.

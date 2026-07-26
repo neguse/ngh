@@ -117,6 +117,41 @@ threaded mode above is what keeps a game loop alive, not the GPU.
 On Linux the GPU delegate additionally needs `EGL_PLATFORM=surfaceless` in a
 headless process, or task creation fails with `Unable to initialize EGL`.
 
+### 3D coordinate spaces
+
+MediaPipe's three outputs use three different conventions, and most of this is
+undocumented upstream (the facts below are pinned against MediaPipe's own
+golden data by `tests/test_space.c`):
+
+| output | space |
+|---|---|
+| normalized landmarks | x,y ∈ [0,1], origin top-left, y down; z is width-normalized pseudo-depth, more negative = closer |
+| pose world landmarks | metres, origin at the hip centre, x right, **y down**, +z away from the camera |
+| face transform matrix | column-major TRS; right-handed, **y up**, camera at origin looking down −z, **centimetres** |
+
+Note that face and pose disagree about which way y and z point. ngh ships
+three pure helpers that bring everything into one documented place — the *ngh
+camera space*: right-handed, +x right, +y up, camera at the origin looking
+down −z, metres:
+
+```c
+float pos[3], quat[4], scale;  /* head position (m) + orientation */
+ngh_face_transform_decompose(result.transform, pos, quat, &scale);
+
+float p[3];                    /* skeleton, hip-centred, y now up */
+ngh_pose_world_to_camera(&result.world_landmarks[i * 4], p);
+
+float v[3];                    /* pseudo-3D from normalized landmarks */
+ngh_landmark_to_view(x, y, z, frame_w, frame_h, v);
+```
+
+Mapping that into your engine is one transform of your own; mirroring,
+scaling and smoothing are your calls, not ngh's. Two caveats: the transform
+matrix's orientation degrades when the face is far from the image centre
+(upstream bug, mediapipe#4759), and pose world has no camera-relative
+translation — it orients the skeleton but does not place it. The helpers use
+`sqrtf`, so add `-lm` on Linux if you call them.
+
 ### Cameras
 
 ngh does not capture video, deliberately. `ngh_image` is the boundary — hand

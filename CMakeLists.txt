@@ -90,13 +90,25 @@ if(NGH_BUILD_TESTS)
             LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
         add_test(NAME test_web
                  COMMAND node $<TARGET_FILE:test_web>)
+
+        # The coordinate helpers are pure math and identical on every
+        # platform; run that part under node too.
+        add_executable(test_space tests/test_space.c)
+        target_link_libraries(test_space PRIVATE ngh)
+        target_include_directories(test_space PRIVATE tests)
+        target_compile_options(test_space PRIVATE ${NGH_WARNINGS})
+        set_target_properties(test_space PROPERTIES
+            SUFFIX ".js"
+            LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
+        add_test(NAME test_space
+                 COMMAND node $<TARGET_FILE:test_space>)
     else()
         ngh_add_program(test_abi tests/test_abi.c)
         target_include_directories(test_abi PRIVATE tests)
         add_test(NAME test_abi COMMAND test_abi)
 
         if(NGH_HAVE_TESTDATA)
-            foreach(t test_golden test_api)
+            foreach(t test_golden test_api test_space)
                 ngh_add_program(${t} tests/${t}.c)
                 target_include_directories(${t} PRIVATE tests)
                 target_link_libraries(${t} PRIVATE ngh_stb_image)
