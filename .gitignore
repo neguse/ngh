@@ -1,0 +1,20 @@
+build/
+build-*/
+.vscode/
+.vs/
+
+# scripts/fetch_*.py land here; nothing in it is redistributable from this repo
+vendor/
+
+# emcc output of examples/web/build.sh
+examples/web/ngh_web.js
+examples/web/ngh_web.wasm
+
+*.o
+*.obj
+*.exe
+*.so
+*.dll
+*.dylib
+*.task
+*.wasm

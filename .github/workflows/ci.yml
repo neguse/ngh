@@ -1,0 +1,129 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Every platform runs the golden comparison against MediaPipe's own test
+  # bundles, so an ABI or loader regression that only shows up on Windows fails
+  # here rather than in someone's game.
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-gcc, os: ubuntu-latest, cc: gcc }
+          - { name: linux-x64-clang, os: ubuntu-latest, cc: clang }
+          - { name: windows-x64-msvc, os: windows-latest, cc: "" }
+          - { name: macos-arm64, os: macos-latest, cc: clang }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the MediaPipe runtime and test data
+        run: |
+          python3 scripts/fetch_libmediapipe.py
+          python3 scripts/fetch_testdata.py
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # CMake stages libmediapipe next to the binaries, so this also covers the
+      # "look beside the executable" branch of ngh_runtime_load().
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # aarch64 has different alignment rules than x86_64. MediaPipe ships arm64
+  # builds for Windows and macOS, so the layout has to hold there too. No
+  # official Linux arm64 wheel exists, so this runs the ABI test alone and lets
+  # the rest skip.
+  abi-arm64:
+    name: linux-arm64 (abi only)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/fetch_testdata.py
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON
+      - run: cmake --build build --parallel
+      - run: ctest --test-dir build --output-on-failure
+
+  # C99 is the promise; C11, C17 and C++ are what people will actually include
+  # it from. The two-unit link catches anything that should have been static.
+  portability:
+    name: standards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile as C99 / C11 / C17 / C++11 / C++17
+        run: |
+          set -eux
+          for std in c99 c11 c17; do
+            for cc in gcc clang; do
+              $cc -std=$std -Wall -Wextra -Wpedantic -Werror -I. -Itests \
+                  -D_POSIX_C_SOURCE=200809L -fsyntax-only tests/test_abi.c
+            done
+          done
+          for std in c++11 c++17; do
+            g++ -x c++ -std=$std -Wall -Wextra -Werror -I. -Itests \
+                -fsyntax-only tests/test_abi.c
+          done
+
+      - name: Link two translation units
+        run: |
+          set -eux
+          cat > tu_a.c <<'EOF'
+          #define NGH_MEDIAPIPE_IMPLEMENTATION
+          #include "ngh_mediapipe.h"
+          int other(void);
+          int main(void) { return ngh_face_options_default().max_faces - 1 + other(); }
+          EOF
+          cat > tu_b.c <<'EOF'
+          #include "ngh_mediapipe.h"
+          int other(void) { return (int)ngh_image_rgb(0, 1, 1, 0).width - 1; }
+          EOF
+          gcc -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -I. \
+              tu_a.c tu_b.c -o two_tu -ldl -lpthread
+          ./two_tu
+
+      - name: Build with NGH_NO_THREADS
+        run: |
+          gcc -std=c99 -D_POSIX_C_SOURCE=200809L -DNGH_NO_THREADS \
+              -Wall -Wextra -Wpedantic -Werror -I. -Itests \
+              -fsyntax-only tests/test_abi.c
+
+  web:
+    name: emscripten
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+
+      - name: Build and test the web backend
+        run: |
+          emcmake cmake -B build-web -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON
+          cmake --build build-web --parallel
+          ctest --test-dir build-web --output-on-failure
+
+      - name: Build the web example
+        run: ./examples/web/build.sh
+
+      - name: Report the wasm ngh itself adds
+        run: ls -l examples/web/ngh_web.js examples/web/ngh_web.wasm

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ngh_mediapipe web example</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; background: #0d1117; color: #c9d1d9; }
+  #stage { position: relative; width: 640px; height: 480px; background: #161b22; }
+  #camera, #overlay { position: absolute; inset: 0; width: 640px; height: 480px; }
+  #camera { transform: scaleX(-1); }
+  #overlay { transform: scaleX(-1); }
+  #status { margin-top: .75rem; font-variant-numeric: tabular-nums; }
+  button { font: inherit; padding: .4rem .9rem; margin-top: .75rem; }
+  code { background: #161b22; padding: .1rem .3rem; }
+</style>
+</head>
+<body>
+<h1>ngh_mediapipe on the web</h1>
+<p>Face landmarks from C, compiled to WebAssembly, bridged to
+   <code>@mediapipe/tasks-vision</code>.</p>
+
+<div id="stage">
+  <video id="camera" autoplay playsinline muted></video>
+  <canvas id="overlay" width="640" height="480"></canvas>
+</div>
+<div id="status">idle</div>
+<button id="start">Start camera</button>
+
+<script src="ngh_web.js"></script>
+<script>
+// The model is fetched here and handed to C as bytes, exactly like the desktop
+// examples read it off disk. Point this at a local copy in production: the
+// MediaPipe wasm alone is ~11.5MB and you do not want a CDN in the critical path.
+const MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task';
+
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('start');
+
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true;
+  try {
+    statusEl.textContent = 'requesting camera...';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480 },
+    });
+    document.getElementById('camera').srcObject = stream;
+
+    statusEl.textContent = 'fetching model...';
+    const bytes = new Uint8Array(await (await fetch(MODEL_URL)).arrayBuffer());
+
+    // Copy the model into wasm memory and pass the pointer to C.
+    const ptr = Module._malloc(bytes.length);
+    Module.HEAPU8.set(bytes, ptr);
+    const rc = Module.ccall('ngh_web_start', 'number',
+                            ['number', 'number'], [ptr, bytes.length]);
+    Module._free(ptr);
+    if (rc !== 0) statusEl.textContent = 'start failed';
+  } catch (err) {
+    statusEl.textContent = String(err);
+    startBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

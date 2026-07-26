@@ -1,0 +1,121 @@
+cmake_minimum_required(VERSION 3.16)
+project(ngh C)
+
+# ngh is header-only: this project exists to build the tests and examples.
+# To use ngh, copy ngh_mediapipe.h and link nothing.
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+option(NGH_BUILD_TESTS "Build the test suite" ON)
+option(NGH_BUILD_EXAMPLES "Build the examples" ON)
+option(NGH_WERROR "Treat warnings as errors" OFF)
+
+add_library(ngh INTERFACE)
+target_include_directories(ngh INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT WIN32 AND NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+    target_link_libraries(ngh INTERFACE ${CMAKE_DL_LIBS} Threads::Threads)
+    target_compile_definitions(ngh INTERFACE _POSIX_C_SOURCE=200809L)
+endif()
+
+if(MSVC)
+    set(NGH_WARNINGS /W4)
+    if(NGH_WERROR)
+        list(APPEND NGH_WARNINGS /WX)
+    endif()
+else()
+    set(NGH_WARNINGS -Wall -Wextra -Wpedantic)
+    if(NGH_WERROR)
+        list(APPEND NGH_WARNINGS -Werror)
+    endif()
+endif()
+
+# scripts/fetch_testdata.py puts stb_image.h and the golden files here.
+set(NGH_TESTDATA "${CMAKE_CURRENT_SOURCE_DIR}/vendor/testdata")
+set(NGH_HAVE_TESTDATA FALSE)
+if(EXISTS "${NGH_TESTDATA}/stb_image.h")
+    set(NGH_HAVE_TESTDATA TRUE)
+endif()
+
+function(ngh_add_program name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE ngh)
+    target_compile_options(${name} PRIVATE ${NGH_WARNINGS})
+endfunction()
+
+# ngh_runtime_load(NULL) searches the executable's own directory, so putting the
+# library next to the binaries is all it takes -- and it exercises that search
+# path rather than the NGH_MEDIAPIPE_PATH override.
+if(NOT EMSCRIPTEN)
+    foreach(lib libmediapipe.so libmediapipe.dll libmediapipe.dylib)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/${lib}")
+            file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/vendor/${lib}"
+                 DESTINATION "${CMAKE_BINARY_DIR}")
+            # Multi-config generators put binaries in a subdirectory.
+            foreach(cfg ${CMAKE_CONFIGURATION_TYPES})
+                file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/vendor/${lib}"
+                     DESTINATION "${CMAKE_BINARY_DIR}/${cfg}")
+            endforeach()
+            message(STATUS "ngh: staged vendor/${lib}")
+        endif()
+    endforeach()
+endif()
+
+# ---------------------------------------------------------------- tests --
+
+if(NGH_BUILD_TESTS)
+    enable_testing()
+
+    if(EMSCRIPTEN)
+        # The browser-only paths cannot run here; test_web covers the wiring,
+        # error propagation and argument checks under node.
+        add_executable(test_web tests/test_web.c)
+        target_link_libraries(test_web PRIVATE ngh)
+        target_include_directories(test_web PRIVATE tests)
+        target_compile_options(test_web PRIVATE ${NGH_WARNINGS})
+        set_target_properties(test_web PROPERTIES
+            SUFFIX ".js"
+            LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
+        add_test(NAME test_web
+                 COMMAND node $<TARGET_FILE:test_web>)
+    else()
+        ngh_add_program(test_abi tests/test_abi.c)
+        target_include_directories(test_abi PRIVATE tests)
+        add_test(NAME test_abi COMMAND test_abi)
+
+        if(NGH_HAVE_TESTDATA)
+            # stb_image is third-party and not warning-clean under our flags.
+            add_library(ngh_stb_image STATIC tests/stb_image_impl.c)
+            target_include_directories(ngh_stb_image PUBLIC ${NGH_TESTDATA})
+            if(NOT WIN32 AND NOT EMSCRIPTEN)
+                target_link_libraries(ngh_stb_image PUBLIC m)
+            endif()
+
+            foreach(t test_golden test_api)
+                ngh_add_program(${t} tests/${t}.c)
+                target_include_directories(${t} PRIVATE tests)
+                target_link_libraries(${t} PRIVATE ngh_stb_image)
+                add_test(NAME ${t}
+                         COMMAND ${t} ${CMAKE_CURRENT_SOURCE_DIR})
+                # 77 is the automake "skipped" convention: the tests use it
+                # when libmediapipe cannot be found.
+                set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
+            endforeach()
+        else()
+            message(STATUS
+                "ngh: skipping test_golden/test_api -- run "
+                "scripts/fetch_testdata.py first")
+        endif()
+    endif()
+endif()
+
+# ------------------------------------------------------------- examples --
+
+if(NGH_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+    ngh_add_program(ngh_game_loop examples/desktop/game_loop.c)
+    if(NGH_HAVE_TESTDATA)
+        ngh_add_program(ngh_still_image examples/desktop/still_image.c)
+        target_link_libraries(ngh_still_image PRIVATE ngh_stb_image)
+    endif()
+endif()
