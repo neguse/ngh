@@ -54,3 +54,7 @@ Recorded so they don't get relitigated. Change only with a stated reason.
 - Intended consumer: `../lub` (SDL3 submodule, release-3.2.30). CI's
   FetchContent pin for the camera example must track lub's SDL tag.
 - Linux GPU delegate needs `EGL_PLATFORM=surfaceless` when headless.
+- Verified in a real browser (Safari, 2026-07): full demo works and the GPU
+  delegate is used, no CPU fallback needed. Demo deploy: scratchpad cfdemo/ ->
+  `npx wrangler deploy` -> https://ngh-demo.negcee.workers.dev (temporary;
+  remove with `npx wrangler delete ngh-demo`).
