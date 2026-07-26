@@ -2,7 +2,11 @@
  *
  * Build (see build.sh):
  *   emcc -std=c99 -O2 -I../.. main.c -o ngh_web.js \
- *        -sEXPORTED_RUNTIME_METHODS=ccall -sALLOW_MEMORY_GROWTH=1
+ *        -sEXPORTED_RUNTIME_METHODS=ccall,HEAPU8 -sALLOW_MEMORY_GROWTH=1
+ *
+ * HEAPU8 must be exported explicitly: index.html copies the fetched model into
+ * wasm memory with Module.HEAPU8.set(), and current Emscripten no longer puts
+ * the heap views on Module by default.
  *
  * The same ngh calls as the desktop examples. Two things differ, and both are
  * visible below:

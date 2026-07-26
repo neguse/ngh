@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 emcc -std=c99 -O2 -Wall -Wextra \
     -I../.. \
     main.c -o ngh_web.js \
-    -sEXPORTED_RUNTIME_METHODS=ccall \
+    -sEXPORTED_RUNTIME_METHODS=ccall,HEAPU8 \
     -sEXPORTED_FUNCTIONS=_main,_malloc,_free \
     -sALLOW_MEMORY_GROWTH=1
 
