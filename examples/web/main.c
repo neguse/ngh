@@ -42,11 +42,14 @@ EM_JS(void, draw_landmarks, (const float *xyz, int count, int stride), {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     if (!count) return;
     ctx.fillStyle = '#39d353';
+    /* The buffer is sized to the camera frame, which may be far wider than
+     * the ~640px it is displayed at; keep the dots visible after scaling. */
+    const s = Math.max(2, Math.round(canvas.width / 320));
     const base = xyz >> 2;
     for (let i = 0; i < count; ++i) {
         const x = HEAPF32[base + i * stride] * canvas.width;
         const y = HEAPF32[base + i * stride + 1] * canvas.height;
-        ctx.fillRect(x - 1, y - 1, 2, 2);
+        ctx.fillRect(x - s / 2, y - s / 2, s, s);
     }
 });
 

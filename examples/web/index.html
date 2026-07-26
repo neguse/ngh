@@ -5,8 +5,10 @@
 <title>ngh_mediapipe web example</title>
 <style>
   body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; background: #0d1117; color: #c9d1d9; }
+  /* The stage is resized to the camera's real aspect once the stream starts;
+     both layers fill it so they always scale together. */
   #stage { position: relative; width: 640px; height: 480px; background: #161b22; }
-  #camera, #overlay { position: absolute; inset: 0; width: 640px; height: 480px; }
+  #camera, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
   #camera { transform: scaleX(-1); }
   #overlay { transform: scaleX(-1); }
   #status { margin-top: .75rem; font-variant-numeric: tabular-nums; }
@@ -44,7 +46,22 @@ startBtn.addEventListener('click', async () => {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480 },
     });
-    document.getElementById('camera').srcObject = stream;
+    const video = document.getElementById('camera');
+    video.srcObject = stream;
+
+    // The constraints above are wishes, not promises: the camera often
+    // delivers another size/aspect (1280x720 is common). Landmarks come back
+    // normalized to the actual frame, so the overlay's drawing buffer must
+    // match the frame and the stage must match its aspect -- otherwise the
+    // points land beside the face.
+    video.addEventListener('loadedmetadata', () => {
+      const w = video.videoWidth, h = video.videoHeight;
+      const overlay = document.getElementById('overlay');
+      overlay.width = w;
+      overlay.height = h;
+      document.getElementById('stage').style.height =
+        Math.round(640 * h / w) + 'px';
+    }, { once: true });
 
     statusEl.textContent = 'fetching model...';
     const bytes = new Uint8Array(await (await fetch(MODEL_URL)).arrayBuffer());
