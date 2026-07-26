@@ -9,6 +9,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(NGH_BUILD_TESTS "Build the test suite" ON)
 option(NGH_BUILD_EXAMPLES "Build the examples" ON)
+option(NGH_EXAMPLES_SDL3 "Build examples that need SDL3 (camera capture)" OFF)
 option(NGH_WERROR "Treat warnings as errors" OFF)
 
 add_library(ngh INTERFACE)
@@ -62,6 +63,16 @@ if(NOT EMSCRIPTEN)
     endforeach()
 endif()
 
+# stb_image decodes JPEGs for the tests and two examples. Third-party, so it
+# gets its own target without our warning flags.
+if(NGH_HAVE_TESTDATA AND NOT EMSCRIPTEN)
+    add_library(ngh_stb_image STATIC tests/stb_image_impl.c)
+    target_include_directories(ngh_stb_image PUBLIC ${NGH_TESTDATA})
+    if(NOT WIN32)
+        target_link_libraries(ngh_stb_image PUBLIC m)
+    endif()
+endif()
+
 # ---------------------------------------------------------------- tests --
 
 if(NGH_BUILD_TESTS)
@@ -85,13 +96,6 @@ if(NGH_BUILD_TESTS)
         add_test(NAME test_abi COMMAND test_abi)
 
         if(NGH_HAVE_TESTDATA)
-            # stb_image is third-party and not warning-clean under our flags.
-            add_library(ngh_stb_image STATIC tests/stb_image_impl.c)
-            target_include_directories(ngh_stb_image PUBLIC ${NGH_TESTDATA})
-            if(NOT WIN32 AND NOT EMSCRIPTEN)
-                target_link_libraries(ngh_stb_image PUBLIC m)
-            endif()
-
             foreach(t test_golden test_api)
                 ngh_add_program(${t} tests/${t}.c)
                 target_include_directories(${t} PRIVATE tests)
@@ -117,5 +121,21 @@ if(NGH_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     if(NGH_HAVE_TESTDATA)
         ngh_add_program(ngh_still_image examples/desktop/still_image.c)
         target_link_libraries(ngh_still_image PRIVATE ngh_stb_image)
+    endif()
+
+    if(NGH_EXAMPLES_SDL3)
+        find_package(SDL3 CONFIG QUIET)
+        if(NOT SDL3_FOUND)
+            include(FetchContent)
+            set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+            # The tag lub pins its SDL submodule to; keep them matched.
+            FetchContent_Declare(SDL3
+                GIT_REPOSITORY https://github.com/libsdl-org/SDL
+                GIT_TAG release-3.2.30
+                GIT_SHALLOW TRUE)
+            FetchContent_MakeAvailable(SDL3)
+        endif()
+        ngh_add_program(ngh_camera_face examples/desktop/camera_face.c)
+        target_link_libraries(ngh_camera_face PRIVATE SDL3::SDL3)
     endif()
 endif()

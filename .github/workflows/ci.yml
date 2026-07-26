@@ -107,6 +107,24 @@ jobs:
               -Wall -Wextra -Wpedantic -Werror -I. -Itests \
               -fsyntax-only tests/test_abi.c
 
+  # The camera sample is the documented wiring pattern for SDL3; keep it
+  # compiling. SDL3 comes through FetchContent pinned to the tag lub uses.
+  # CI machines have no cameras, so running it exercises enumeration + the
+  # clean "no cameras found" exit.
+  camera-example:
+    name: sdl3 camera example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON
+          -DNGH_EXAMPLES_SDL3=ON -DNGH_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Run headless
+        run: ./build/ngh_camera_face
+
   web:
     name: emscripten
     runs-on: ubuntu-latest

@@ -117,6 +117,35 @@ threaded mode above is what keeps a game loop alive, not the GPU.
 On Linux the GPU delegate additionally needs `EGL_PLATFORM=surfaceless` in a
 headless process, or task creation fails with `Unable to initialize EGL`.
 
+### Cameras
+
+ngh does not capture video, deliberately. `ngh_image` is the boundary — hand
+ngh whatever frames you already have.
+
+On desktop, SDL3's camera API already is the unified answer: enumeration,
+permission prompts and frame delivery across Windows (Media Foundation), Linux
+(V4L2 / PipeWire), macOS (CoreMedia), Android and iOS. Wrapping that in another
+API would just rename it, so ngh doesn't. The entire bridge is one call:
+
+```c
+SDL_Surface *frame = SDL_AcquireCameraFrame(cam, &ts_ns);
+if (frame) {
+    ngh_image img = ngh_image_rgba(frame->pixels, frame->w, frame->h, frame->pitch);
+    ngh_face_detect(face, &img, ts_ns / 1000000, &result);
+    SDL_ReleaseCameraFrame(cam, frame);
+}
+```
+
+`examples/desktop/camera_face.c` is the full loop, permission polling included
+— SDL's permission state and ngh's creation state are both polls, so they share
+one loop. Build it with `-DNGH_EXAMPLES_SDL3=ON`.
+
+On the web, do **not** route frames through SDL's camera backend: it reads
+every frame back from a canvas with `getImageData()` (GPU→CPU), and MediaPipe
+then uploads it again. Call `getUserMedia` yourself, attach the stream to a
+`<video>` element, and pass it with `ngh_web_source_from_selector()` — which is
+exactly what `examples/web/` does.
+
 ### Web notes
 
 The defaults point at a pinned CDN for both the JS bundle and the ~11.5 MB
