@@ -653,6 +653,19 @@ static ngh__runtime ngh__rt;
 #define NGH__LIB_NAME "libmediapipe.so"
 #endif
 
+/* MSVC deprecates getenv (C4996); the CRT race it warns about cannot happen
+ * here since nothing in this process rewrites the environment. */
+static const char *ngh__getenv(const char *name) {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    return getenv(name);
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
+
 static void *ngh__dlopen(const char *utf8_path) {
 #if defined(_WIN32)
     wchar_t wide[1024];
@@ -772,7 +785,7 @@ int ngh_runtime_load(const char *path) {
         return NGH_ERR_NO_RUNTIME;
     }
 
-    env = getenv("NGH_MEDIAPIPE_PATH");
+    env = ngh__getenv("NGH_MEDIAPIPE_PATH");
     if (env && *env && ngh__try_load(env)) return NGH_OK;
 
     if (ngh__exe_dir(buf, sizeof(buf))) {

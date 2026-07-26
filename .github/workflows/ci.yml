@@ -116,10 +116,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # SDL_UNIX_CONSOLE_BUILD: the runner has no X11/Wayland headers and the
+      # camera sample opens no windows, so build SDL without a video backend.
       - name: Configure
         run: >
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON
           -DNGH_EXAMPLES_SDL3=ON -DNGH_BUILD_TESTS=OFF
+          -DSDL_UNIX_CONSOLE_BUILD=ON
       - name: Build
         run: cmake --build build --parallel
       - name: Run headless
