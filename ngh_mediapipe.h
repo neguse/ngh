@@ -1,33 +1,174 @@
 /* ngh_mediapipe.h -- MediaPipe face / body tracking from C.
  *
- * Single-header, C99. Define NGH_MEDIAPIPE_IMPLEMENTATION in exactly one
- * translation unit before including this file:
+ * One header, one API, across Windows, Linux, macOS and the web. This comment
+ * is the documentation; the header is the deliverable. Copy the file, then in
+ * exactly one translation unit:
  *
  *     #define NGH_MEDIAPIPE_IMPLEMENTATION
  *     #include "ngh_mediapipe.h"
  *
- * Backends
- *   Desktop (Windows / Linux / macOS)
- *       Resolves the official MediaPipe Tasks C API out of libmediapipe.{dll,so,dylib}
- *       at run time. Nothing is needed at link time. Fetch the library with
- *       scripts/fetch_libmediapipe.py.
- *   Web (Emscripten)
- *       Bridges to @mediapipe/tasks-vision through EM_JS. No extra link flags:
- *       ASYNCIFY is not required because MediaPipe's detect calls are synchronous.
+ * There is nothing to link. On desktop the implementation resolves the
+ * official MediaPipe Tasks C API out of libmediapipe.{dll,so,dylib} at run
+ * time; on the web (Emscripten) it bridges to @mediapipe/tasks-vision through
+ * EM_JS, with no extra emcc flags.
  *
- * The same source builds against both. Task creation is asynchronous on the web,
- * so creation is always a non-blocking call followed by polling ngh_face_state().
- * On desktop the state is NGH_READY as soon as ngh_face_create() returns.
+ * ==========================================================================
+ * Quick start
+ * ==========================================================================
  *
- * Configuration macros (define before including the implementation)
- *   NGH_NO_THREADS          Drop the worker-thread code path entirely.
- *   NGH_WEB_BUNDLE_URL      Default @mediapipe/tasks-vision ESM bundle URL.
- *   NGH_WEB_WASM_BASE       Default directory holding vision_wasm_internal.*
+ *     ngh_face_options opt = ngh_face_options_default();
+ *     ngh_face *face = ngh_face_create(model_bytes, model_size, &opt);
  *
- * See README.md for the platform matrix and measured latencies.
+ *     ngh_face_result result;
+ *     ngh_face_result_alloc(&result, opt.max_faces, 1, 0);
+ *
+ *     // Per frame. Timestamps must strictly increase.
+ *     if (ngh_face_state(face) == NGH_READY) {
+ *         ngh_image img = ngh_image_rgba(pixels, width, height, 0);
+ *         int faces = ngh_face_detect(face, &img, timestamp_ms, &result);
+ *         for (int i = 0; i < faces; ++i) {
+ *             const float *lm = result.landmarks + i * NGH_FACE_LANDMARKS * 3;
+ *             float jaw = result.blendshapes[i * NGH_FACE_BLENDSHAPES + 25];
+ *         }
+ *     }
+ *
+ * ngh_pose_* mirrors this with 33 landmarks of (x, y, z, visibility) and
+ * optional metric world coordinates.
+ *
+ * Two deliberate behaviours to understand before shipping:
+ *
+ * CREATION IS POLLED, NEVER AWAITED. create() returns immediately and
+ * ngh_face_state() reports NGH_PENDING until the task is up -- instantly on
+ * desktop, a few frames on the web. The same loop is correct everywhere, and
+ * ASYNCIFY (a link flag a header cannot impose, costing roughly 50% in size
+ * and speed program-wide) is never needed.
+ *
+ * DETECTION IS NON-BLOCKING BY DEFAULT on desktop (options.threaded).
+ * detect() hands the frame to a worker and returns the newest finished
+ * result, so result.timestamp_ms may lag the frame you submitted, and frames
+ * submitted while the worker is busy are dropped -- deliberately: the newest
+ * frame is the only one worth tracking. Inference costs ~9ms of a single
+ * core against a 16.6ms budget at 60fps, and MediaPipe will not parallelise
+ * it. Set threaded = 0 to get the result for the exact frame you passed in,
+ * and eat the latency (fine for still images; see the golden tests).
+ *
+ * ==========================================================================
+ * Getting the runtime and the models
+ * ==========================================================================
+ *
+ * Google ships the Tasks C API only inside the `mediapipe` wheels on PyPI --
+ * there is no standalone download. scripts/fetch_libmediapipe.py extracts it
+ * with SHA256 verification, or pull mediapipe/tasks/c/libmediapipe.* out of
+ * the 0.10.35 wheel yourself.
+ *
+ * ngh_runtime_load(NULL) searches $NGH_MEDIAPIPE_PATH, then the directory of
+ * the running executable, then the loader's default path. The first create()
+ * loads lazily; calling ngh_runtime_load() up front just lets you report a
+ * missing runtime before any other setup.
+ *
+ * Models are .task bundles (Apache-2.0) from Google's model zoo;
+ * scripts/fetch_models.py fetches face_landmarker (478 landmarks + 52
+ * blendshapes + transform matrix, 3.8MB) and pose_landmarker
+ * lite/full/heavy (5.8/9.4/30.7MB). ngh takes models as bytes, so bundle
+ * them however your platform likes -- that one signature works everywhere,
+ * including Android assets later.
+ *
+ * ==========================================================================
+ * Platforms and acceleration
+ * ==========================================================================
+ *
+ *     Windows 10+ x64/arm64    libmediapipe.dll         CPU only
+ *     Linux x64                libmediapipe.so          CPU; GPU opt-in
+ *     macOS arm64              libmediapipe.dylib       CPU; GPU opt-in
+ *     Web (Emscripten)         @mediapipe/tasks-vision  GPU; CPU fallback
+ *     Android / iOS            planned
+ *
+ * Windows cannot use the GPU, and it is not a packaging problem: upstream's
+ * only desktop GPU path is a GL ES compute shader, there is no WGL context
+ * implementation in the tree, and mediapipe/gpu/BUILD disables GPU for
+ * os:windows unconditionally. accel is therefore a HINT; ask
+ * ngh_face_accel() / ngh_pose_accel() what is actually running.
+ *
+ * That limit matters less than it sounds. Measured on a Ryzen 7 PRO 5750GE
+ * with a Vega iGPU (VIDEO mode, p50 over 270 frames):
+ *
+ *                          CPU         GPU
+ *     face landmarks       9.2 ms     12.0 ms    <- GPU is SLOWER
+ *     pose lite           14.4 ms     10.4 ms
+ *     pose full           19.7 ms     11.7 ms
+ *     pose heavy          57.3 ms     24.5 ms
+ *
+ * The face models are too small (192px detector, 256px landmarks) to
+ * amortise the per-frame upload and sync. What the GPU buys is CPU headroom
+ * (1.0 core down to 0.2-0.5); on CPU it is threaded mode, not the GPU, that
+ * keeps a frame budget intact. Headless Linux GPU additionally requires
+ * EGL_PLATFORM=surfaceless, or creation fails with "Unable to initialize
+ * EGL".
+ *
+ * ==========================================================================
+ * The web backend
+ * ==========================================================================
+ *
+ * Defaults point at a pinned CDN for the tasks-vision bundle and its ~11.5MB
+ * wasm. Fine for prototyping; in production copy
+ * node_modules/@mediapipe/tasks-vision/{vision_bundle.mjs,wasm} into your
+ * assets and point ngh_web_set_bundle_url() / ngh_web_set_wasm_base() at
+ * them before the first create().
+ *
+ * ngh_image_rgba() works on the web and keeps code identical across
+ * platforms, at one copy per frame. For live video prefer
+ * ngh_web_source_from_selector("#camera"): MediaPipe uploads every input
+ * with texImage2D regardless, so handing it the <video> element skips the
+ * round trip through wasm memory. A WebGL canvas created with
+ * preserveDrawingBuffer:false must be passed inside the same
+ * requestAnimationFrame callback that drew it.
+ *
+ * ngh never touches your canvas or GL context: MediaPipe gets its own
+ * OffscreenCanvas, and the upstream option that would let it resize yours is
+ * deliberately not exposed.
+ *
+ * If you capture with SDL3, do NOT route web frames through SDL's camera
+ * backend -- it reads every frame back with getImageData (GPU->CPU) and
+ * MediaPipe uploads it again. Desktop SDL3 capture is the intended pairing
+ * though; examples/desktop/camera_face.c is the wiring pattern (frame->pitch
+ * goes straight into the stride argument, frame timestamps straight into
+ * detect()).
+ *
+ * ==========================================================================
+ * The ABI is pinned to one MediaPipe release
+ * ==========================================================================
+ *
+ * NGH_MEDIAPIPE_ABI below names the release this header's struct layouts
+ * target. The Tasks C API makes no stability promise and upstream master has
+ * already moved (three new MpBaseOptions fields = +16 bytes through every
+ * option struct). A mismatched runtime does not fail loudly -- it misreads
+ * running_mode and reports "Unsupported running mode: unknown mode". The
+ * layouts are locked by static asserts here and by tests/test_abi.c; a new
+ * runtime version means re-deriving them, not hoping.
+ *
+ * ==========================================================================
+ * Configuration macros (define before the implementation include)
+ * ==========================================================================
+ *
+ *     NGH_MEDIAPIPE_IMPLEMENTATION   Emit the implementation (exactly 1 TU).
+ *     NGH_NO_THREADS                 Drop the worker-thread path entirely;
+ *                                    options.threaded becomes a no-op.
+ *     NGH_WEB_BUNDLE_URL             Default tasks-vision ESM bundle URL.
+ *     NGH_WEB_WASM_BASE              Default dir of vision_wasm_internal.*
+ *
+ * Coordinate conventions (which output lives in which 3D space, and the
+ * helpers that unify them) are documented at the "coordinate helpers"
+ * section further down, next to the functions themselves.
+ *
+ * Verification: the test suite compares against MediaPipe's own golden data
+ * at upstream's tolerances (landmarks 0.03, blendshapes 0.12); current
+ * deviations are 0.0045 / 0.083 / 0.024. The helpers using sqrtf may need
+ * -lm on Linux.
  *
  * License: MIT (see LICENSE.txt). MediaPipe itself is Apache-2.0 and is not
- * redistributed here; see THIRDPARTY.md.
+ * redistributed with this header. If you ship libmediapipe, the wheel's
+ * LICENSE lacks the notices for its statically linked BSD/zlib dependencies
+ * -- see THIRDPARTY.md in the ngh repository before redistributing.
  */
 
 #ifndef NGH_MEDIAPIPE_H_INCLUDED

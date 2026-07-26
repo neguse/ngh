@@ -48,6 +48,11 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   notice obligations are in `THIRDPARTY.md` — the MediaPipe wheel's LICENSE
   does not carry the notices for its statically linked BSD/zlib dependencies.
 
+- Documentation lives in the header, stb-style: the top comment of
+  ngh_mediapipe.h is the user manual and travels with the copied file.
+  README.md is repository-level only (setup, scripts, licence pointers).
+  Never document the same fact in both places.
+
 ## Working notes
 
 - Full check: `scripts/fetch_libmediapipe.py && scripts/fetch_testdata.py`,
