@@ -46,6 +46,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # picotls's CMake does FIND_PACKAGE(PkgConfig REQUIRED)
+          choco install pkgconfiglite --no-progress -y
           vcpkg install openssl:x64-windows-static-md
           $toolchain = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           $args = "-DCMAKE_TOOLCHAIN_FILE=$toolchain -DVCPKG_TARGET_TRIPLET=x64-windows-static-md"

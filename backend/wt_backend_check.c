@@ -22,6 +22,20 @@ static void sleep_ms(unsigned ms) { usleep(ms * 1000); }
 #define STREAM_MSG "hello stream over the backend abi"
 #define DGRAM_MSG  "hello datagram over the backend abi"
 
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
 static int hex_decode(const char* hex, uint8_t* out, size_t out_len)
 {
     size_t i;
@@ -29,11 +43,12 @@ static int hex_decode(const char* hex, uint8_t* out, size_t out_len)
         return -1;
     }
     for (i = 0; i < out_len; i++) {
-        unsigned v;
-        if (sscanf(hex + 2 * i, "%2x", &v) != 1) {
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
             return -1;
         }
-        out[i] = (uint8_t)v;
+        out[i] = (uint8_t)((hi << 4) | lo);
     }
     return 0;
 }
