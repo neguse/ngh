@@ -48,6 +48,12 @@ def main() -> int:
     # e.g. a vcpkg toolchain on Windows:
     #   NGH_PICOQUIC_CMAKE_ARGS=-DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake
     extra = os.environ.get("NGH_PICOQUIC_CMAKE_ARGS", "").split()
+    if os.name == "nt":
+        # picotls includes wincompat.h, which lives in picoquic's tree; the
+        # FetchContent build of picotls does not know that path on its own.
+        # Keep MSVC's default flags -- overriding CMAKE_C_FLAGS drops them.
+        inc = (src / "picoquic").resolve()
+        extra.append(f"-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /W3 /I{inc}")
     run(["cmake", "-B", "build",
          "-DCMAKE_BUILD_TYPE=Release",
          "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
