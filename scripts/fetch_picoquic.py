@@ -51,9 +51,12 @@ def main() -> int:
     if os.name == "nt":
         # picotls includes wincompat.h, which lives in picoquic's tree; the
         # FetchContent build of picotls does not know that path on its own.
+        # wincompat.h pulls Winsock2.h but not ws2tcpip.h, which picotls
+        # needs for sockaddr_in6/inet_pton, hence the force-include.
         # Keep MSVC's default flags -- overriding CMAKE_C_FLAGS drops them.
         inc = (src / "picoquic").resolve()
-        extra.append(f"-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /W3 /I{inc}")
+        extra.append(
+            f"-DCMAKE_C_FLAGS=/DWIN32 /D_WINDOWS /W3 /I{inc} /FIws2tcpip.h")
     run(["cmake", "-B", "build",
          "-DCMAKE_BUILD_TYPE=Release",
          "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
