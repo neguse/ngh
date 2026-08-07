@@ -106,7 +106,11 @@ if(EXISTS "${NGH_PICOQUIC}/.ngh_built" AND NOT EMSCRIPTEN)
             ${NGH_BROTLI_DEC} ${NGH_BROTLI_ENC})
     endif()
     if(WIN32)
-        target_link_libraries(ngh_wt_backend PRIVATE ws2_32 iphlpapi)
+        # wintimeofday lives in picotls's Visual Studio tree only; its
+        # CMake build never compiles it. bcrypt backs minicrypto's RNG.
+        target_sources(ngh_wt_backend PRIVATE
+            "${NGH_PICOQUIC}/build/_deps/picotls-src/picotlsvs/picotls/wintimeofday.c")
+        target_link_libraries(ngh_wt_backend PRIVATE ws2_32 iphlpapi bcrypt)
     else()
         target_link_libraries(ngh_wt_backend PRIVATE ${CMAKE_DL_LIBS} m)
     endif()
