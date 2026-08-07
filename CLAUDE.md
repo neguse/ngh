@@ -91,9 +91,13 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   one post_fin callback with length > 0 -- consume bytes there too.
   Cross-stack interop is a ctest: `cmake -B build -DNGH_WT_INTEROP=ON`
   runs tests/wt_interop.py (wtransport echo server in tests/wt-echo,
-  needs cargo). Windows: code is ported (CRITICAL_SECTION, WSAStartup,
-  vcpkg static OpenSSL in .github/workflows/wt-backend.yml) but only CI
-  has verified nothing yet -- first green wt-backend run is the proof.
+  needs cargo). Windows is CI-verified (wt-backend workflow builds the
+  DLL with vcpkg static OpenSSL and runs test_wt's load/failure paths);
+  the full echo round-trip has only run on Linux so far. The
+  picotls/picoquic CMake path is unmaintained upstream on Windows (they
+  ship VS projects): the gaps are patched in scripts/fetch_picoquic.py
+  (pkg-config, wincompat.h include path, /FIws2tcpip.h) and CMakeLists
+  (compile picotlsvs wintimeofday.c into the backend, link bcrypt).
   Releases: push a `wt-backend-v*` tag and the workflow attaches the
   per-platform binaries.
 - Verified in a real browser (Safari, 2026-07): full demo works and the GPU
