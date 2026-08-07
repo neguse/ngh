@@ -10,6 +10,9 @@ vendor/
 examples/web/ngh_web.js
 examples/web/ngh_web.wasm
 
+# cargo build of the interop echo server
+tests/wt-echo/target/
+
 *.o
 *.obj
 *.exe

@@ -9,6 +9,7 @@ itself.
 | library | what |
 |---|---|
 | [`ngh_mediapipe.h`](ngh_mediapipe.h) | MediaPipe face / pose tracking. Windows 10+, Linux, macOS, Web (Emscripten); Android/iOS planned. 478 face landmarks + 52 blendshapes + head transform, 33 pose landmarks + metric world coordinates. |
+| [`ngh_webtransport.h`](ngh_webtransport.h) | WebTransport client. Linux, Windows (in progress), Web (Emscripten). Sessions, datagrams, bidi/uni streams, certificate pinning; poll-based, no callbacks. Desktop needs the `ngh_wt_backend` library (picoquic, built by `scripts/fetch_picoquic.py` + CMake). |
 
 ## Repository setup
 
@@ -19,6 +20,7 @@ runtime, models and golden data — none of which is committed here:
 python3 scripts/fetch_libmediapipe.py   # runtime -> vendor/  (from the PyPI wheel)
 python3 scripts/fetch_models.py         # .task models -> vendor/
 python3 scripts/fetch_testdata.py       # golden data + stb_image -> vendor/testdata/
+python3 scripts/fetch_picoquic.py       # webtransport backend deps -> vendor/picoquic/
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
@@ -27,6 +29,8 @@ ctest --test-dir build --output-on-failure
 
 Examples (`build/ngh_still_image`, `build/ngh_game_loop`; add
 `-DNGH_EXAMPLES_SDL3=ON` for the webcam example `ngh_camera_face`).
+Add `-DNGH_WT_INTEROP=ON` (needs cargo) to also run the WebTransport
+interop test against a Rust echo server.
 
 For the web:
 
