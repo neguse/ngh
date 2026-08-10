@@ -143,7 +143,8 @@ typedef struct ngh_wt_options {
      * now; see the manual above). */
     const uint8_t *cert_hashes;
     size_t cert_hash_count;
-    uint32_t idle_timeout_ms;    /* 0 = default */
+    uint32_t idle_timeout_ms;    /* 0 = default (30s). Desktop only; the
+                                  * browser owns its own QUIC timeouts. */
     uint32_t connect_timeout_ms; /* 0 = default (10s) */
 } ngh_wt_options;
 
@@ -592,10 +593,12 @@ EM_JS(void, ngh_wt__js_boot, (void), {
         const st = {
             bidi : bidi,
             writer : null,
+            reader : null,
             canRead : canRead,
             canWrite : canWrite,
             pend : [],       /* writes queued before the writer exists */
             pendClose : false,
+            pendReset : null, /* stream error code of a pre-writer reset */
             sendBytes : 0,
             rq : [],
             rqBytes : 0,
@@ -610,12 +613,38 @@ EM_JS(void, ngh_wt__js_boot, (void), {
         return st;
     };
 
+    W.abortWriter = function(st) {
+        if (!st.writer) return;
+        let err;
+        const code = (st.pendReset === null ? 0 : st.pendReset) >>> 0;
+        try {
+            err = new WebTransportError("reset", {streamErrorCode : code});
+        } catch (e) {
+            try {
+                err = new WebTransportError({streamErrorCode : code});
+            } catch (e2) {
+                err = undefined;
+            }
+        }
+        st.writer.abort(err).catch(() => {});
+    };
+
     W.attachWriter = function(st, writable) {
         st.writer = writable.getWriter();
+        if (st.pendReset !== null) {
+            /* a reset requested before the writer existed must stay a
+             * reset, never turn into a graceful FIN */
+            st.pend = [];
+            W.abortWriter(st);
+            return;
+        }
         for (const chunk of st.pend) {
             st.writer.write(chunk).then(
                 () => { st.sendBytes -= chunk.length; },
-                () => {});
+                () => {
+                    st.sendBytes -= chunk.length;
+                    st.reset = true;
+                });
         }
         st.pend = [];
         if (st.pendClose) {
@@ -626,14 +655,26 @@ EM_JS(void, ngh_wt__js_boot, (void), {
     W.pumpRead = async function(st, readable) {
         try {
             const reader = readable.getReader();
+            st.reader = reader;
             for (;;) {
+                if (st.dead) {
+                    reader.cancel().catch(() => {});
+                    break;
+                }
                 if (st.rqBytes >= W.RECV_WATERMARK) {
                     await new Promise((r) => { st.resume = r; });
-                    if (st.dead) break;
+                    if (st.dead) {
+                        reader.cancel().catch(() => {});
+                        break;
+                    }
                 }
                 const {done, value} = await reader.read();
                 if (done) {
                     st.fin = true;
+                    break;
+                }
+                if (st.dead) {
+                    reader.cancel().catch(() => {});
                     break;
                 }
                 st.rq.push(value);
@@ -663,6 +704,19 @@ EM_JS(void, ngh_wt__js_boot, (void), {
             for (;;) {
                 const {done, value} = await reader.read();
                 if (done) break;
+                if (e.acceptq.length >= 64) {
+                    /* refuse before adopting: cancel/abort the browser
+                     * stream so the peer sees the rejection */
+                    try {
+                        if (bidi) {
+                            value.readable.cancel().catch(() => {});
+                            value.writable.abort().catch(() => {});
+                        } else {
+                            value.cancel().catch(() => {});
+                        }
+                    } catch (err) {}
+                    continue;
+                }
                 let st;
                 if (bidi) {
                     st = W.makeStream(1, true, true);
@@ -671,11 +725,6 @@ EM_JS(void, ngh_wt__js_boot, (void), {
                 } else {
                     st = W.makeStream(0, true, false);
                     W.pumpRead(st, value);
-                }
-                if (e.acceptq.length >= 64) {
-                    st.dead = true;
-                    W.streams[st.sid] = null;
-                    continue;
                 }
                 e.acceptq.push(st.sid);
             }
@@ -784,6 +833,21 @@ EM_JS(void, ngh_wt__js_session_destroy, (int h), {
     if (e.t && e.state <= 1) {
         try { e.t.close(); } catch (err) {}
     }
+    /* streams never accepted have no handle anyone could destroy */
+    for (const sid of e.acceptq) {
+        const st = W.streams[sid];
+        if (!st) continue;
+        st.dead = true;
+        if (st.resume) {
+            const r = st.resume;
+            st.resume = null;
+            r();
+        }
+        if (st.reader) st.reader.cancel().catch(() => {});
+        if (st.writer) st.writer.abort().catch(() => {});
+        W.streams[sid] = null;
+    }
+    e.acceptq = [];
     W.sessions[h] = null;
 })
 
@@ -857,7 +921,10 @@ EM_JS(int, ngh_wt__js_stream_write, (int sid, const uint8_t *p, int len), {
     if (st.writer) {
         st.writer.write(bytes).then(
             () => { st.sendBytes -= n; },
-            () => {});
+            () => {
+                st.sendBytes -= n;
+                st.reset = true;
+            });
     } else {
         st.pend.push(bytes);
     }
@@ -904,10 +971,14 @@ EM_JS(int, ngh_wt__js_stream_read, (int sid, uint8_t *p, int cap), {
 })
 
 EM_JS(void, ngh_wt__js_stream_reset, (int sid, int code), {
-    const st = globalThis.__NGH.wt.streams[sid];
+    const W = globalThis.__NGH.wt;
+    const st = W.streams[sid];
     if (!st) return;
-    if (st.writer) st.writer.abort().catch(() => {});
-    st.pendClose = true;
+    st.pendReset = code >>> 0;
+    st.pendClose = true; /* no FIN may follow a reset */
+    st.reset = true;     /* dead both ways from the caller's point of view */
+    st.pend = [];
+    if (st.writer) W.abortWriter(st);
 })
 
 EM_JS(void, ngh_wt__js_stream_destroy, (int sid), {
@@ -920,6 +991,7 @@ EM_JS(void, ngh_wt__js_stream_destroy, (int sid), {
         st.resume = null;
         r();
     }
+    if (st.reader) st.reader.cancel().catch(() => {});
     if (st.writer && !st.pendClose) st.writer.abort().catch(() => {});
     W.streams[sid] = null;
 })

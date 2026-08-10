@@ -151,6 +151,30 @@ int main(int argc, char** argv)
         ngh_wtb_stream_destroy(st);
     }
     ngh_wtb_session_destroy(s);
+
+    /* Pin isolation: a second session pinning a different hash must not
+     * ride on the first session's pin. */
+    {
+        ngh_wtb_session* s2;
+        int isolated = 0;
+        hash[0] ^= 0xff;
+        s2 = ngh_wtb_connect(ctx, url, &opt);
+        if (s2 == NULL) {
+            fprintf(stderr, "pin-isolation connect failed to start\n");
+        }
+        else {
+            for (i = 0; i < 500 && ngh_wtb_session_state(s2) == NGH_WTB_PENDING;
+                 i++) {
+                sleep_ms(10);
+            }
+            isolated = (ngh_wtb_session_state(s2) != NGH_WTB_READY);
+            printf("pin isolation: %s\n", isolated ? "OK (rejected)" : "BROKEN");
+            ngh_wtb_session_destroy(s2);
+        }
+        if (!isolated) {
+            dgram_ok = stream_ok = 0; /* fail the run */
+        }
+    }
     ngh_wtb_ctx_destroy(ctx);
 
     if (dgram_ok && stream_ok) {

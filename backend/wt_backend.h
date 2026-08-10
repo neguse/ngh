@@ -63,9 +63,10 @@ typedef struct ngh_wtb_options {
     /* Server certificate pinning, same model as the browser's
      * serverCertificateHashes: SHA-256 over the end-entity certificate in
      * DER form. `cert_hashes` is cert_hash_count concatenated 32-byte
-     * hashes; a presented certificate matching any hash passes. NULL/0
-     * selects normal CA verification (Linux: system store; Windows CA
-     * verification is a later work item -- pinning always works). */
+     * hashes; a presented certificate matching any of THIS session's
+     * hashes passes. NULL/0 is reserved for CA verification, which is not
+     * implemented yet: connect fails loudly rather than silently skipping
+     * verification. */
     const uint8_t* cert_hashes;
     size_t cert_hash_count;
     uint32_t idle_timeout_ms;   /* 0 = backend default */

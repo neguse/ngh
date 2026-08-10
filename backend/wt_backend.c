@@ -201,6 +201,8 @@ struct ngh_wtb_session {
     int port;
     char* path;
     char* authority;
+    uint8_t* pins; /* pin_count concatenated 32-byte digests */
+    size_t pin_count;
     uint32_t idle_timeout_ms;
     uint32_t connect_timeout_ms;
     uint64_t connect_deadline;
@@ -224,11 +226,6 @@ struct ngh_wtb_session {
     size_t accept_count;
 };
 
-typedef struct wtb_pin {
-    struct wtb_pin* next;
-    uint8_t hash[32];
-} wtb_pin;
-
 struct ngh_wtb_ctx {
     picoquic_quic_t* quic;
     picoquic_network_thread_ctx_t* net;
@@ -237,7 +234,6 @@ struct ngh_wtb_ctx {
     wtb_op* op_head;
     wtb_op* op_tail;
     ngh_wtb_session* sessions;
-    wtb_pin* pins;
     ptls_verify_certificate_t verifier;
     char err[256];
 };
@@ -346,10 +342,12 @@ static int wtb_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
     void** verify_data, ptls_iovec_t* certs, size_t num_certs)
 {
     ngh_wtb_ctx* ctx = (ngh_wtb_ctx*)((char*)self - offsetof(ngh_wtb_ctx, verifier));
+    /* picoquic keeps its connection in the ptls app-data slot; that is the
+     * road back to the one session whose pins may vouch for this chain. */
+    picoquic_cnx_t* cnx = (picoquic_cnx_t*)*ptls_get_data_ptr(tls);
     uint8_t digest[32];
-    wtb_pin* pin;
+    ngh_wtb_session* s;
     int matched = 0;
-    (void)tls;
     (void)server_name;
 
     *verify_sign = NULL;
@@ -359,9 +357,15 @@ static int wtb_verify_cb(ptls_verify_certificate_t* self, ptls_t* tls,
     }
     SHA256(certs[0].base, certs[0].len, digest);
     wtb_mutex_lock(&ctx->lock);
-    for (pin = ctx->pins; pin != NULL; pin = pin->next) {
-        if (memcmp(pin->hash, digest, 32) == 0) {
-            matched = 1;
+    for (s = ctx->sessions; s != NULL; s = s->next) {
+        if (s->cnx == cnx) {
+            size_t i;
+            for (i = 0; i < s->pin_count; i++) {
+                if (memcmp(s->pins + 32 * i, digest, 32) == 0) {
+                    matched = 1;
+                    break;
+                }
+            }
             break;
         }
     }
@@ -429,6 +433,7 @@ static void wtb_session_unref(ngh_wtb_session* s)
         free(s->host);
         free(s->path);
         free(s->authority);
+        free(s->pins);
         free(s);
     }
 }
@@ -648,6 +653,10 @@ static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
         wtb_session_fail(s, "cannot resolve host");
         return;
     }
+    /* Applies to the connection created just below; ops are serialized on
+     * this thread, so the quic-wide default cannot leak across sessions. */
+    picoquic_set_default_idle_timeout(ctx->quic,
+        (s->idle_timeout_ms != 0) ? s->idle_timeout_ms : 30000);
     if (picowt_prepare_client_cnx(ctx->quic, (struct sockaddr*)&addr,
             &s->cnx, &s->h3, &s->control, now, s->host) != 0) {
         wtb_session_fail(s, "connection setup failed");
@@ -682,6 +691,15 @@ static void wtb_do_session_teardown(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
     for (st = s->streams; st != NULL; st = st->next) {
         st->hs = NULL;
     }
+    /* Streams never accepted have no handle anyone could destroy; free
+     * them here so they cannot pin the session forever. */
+    while (s->accept_head != NULL) {
+        ngh_wtb_stream* victim = s->accept_head;
+        s->accept_head = victim->accept_next;
+        wtb_stream_free_shell(victim);
+    }
+    s->accept_tail = NULL;
+    s->accept_count = 0;
     /* unlink from ctx */
     {
         ngh_wtb_session** pp = &ctx->sessions;
@@ -918,11 +936,6 @@ void ngh_wtb_ctx_destroy(ngh_wtb_ctx* ctx)
     wtb_mutex_unlock(&ctx->lock);
 
     picoquic_free(ctx->quic);
-    while (ctx->pins != NULL) {
-        wtb_pin* p = ctx->pins;
-        ctx->pins = p->next;
-        free(p);
-    }
     wtb_mutex_destroy(&ctx->lock);
     free(ctx);
 }
@@ -1017,19 +1030,19 @@ ngh_wtb_session* ngh_wtb_connect(ngh_wtb_ctx* ctx, const char* url,
     s->idle_timeout_ms = opt->idle_timeout_ms;
     s->connect_timeout_ms = (opt->connect_timeout_ms != 0) ?
         opt->connect_timeout_ms : WTB_CONNECT_TIMEOUT_MS_DEFAULT;
+    s->pins = (uint8_t*)malloc(32 * opt->cert_hash_count);
+    if (s->pins == NULL) {
+        snprintf(ctx->err, sizeof(ctx->err), "out of memory");
+        free(s->host);
+        free(s->path);
+        free(s->authority);
+        free(s);
+        return NULL;
+    }
+    memcpy(s->pins, opt->cert_hashes, 32 * opt->cert_hash_count);
+    s->pin_count = opt->cert_hash_count;
 
     wtb_mutex_lock(&ctx->lock);
-    {
-        size_t i;
-        for (i = 0; i < opt->cert_hash_count; i++) {
-            wtb_pin* pin = (wtb_pin*)malloc(sizeof(wtb_pin));
-            if (pin != NULL) {
-                memcpy(pin->hash, opt->cert_hashes + 32 * i, 32);
-                pin->next = ctx->pins;
-                ctx->pins = pin;
-            }
-        }
-    }
     s->next = ctx->sessions;
     ctx->sessions = s;
     wtb_op_push(ctx, WTB_OP_CONNECT, s, NULL, 0, NULL);
@@ -1079,6 +1092,11 @@ void ngh_wtb_session_destroy(ngh_wtb_session* s)
     ctx = s->ctx;
     wtb_mutex_lock(&ctx->lock);
     s->dead = 1;
+    /* Surviving stream handles must observe the end immediately, not after
+     * the network thread gets around to the teardown op. */
+    if (s->state == NGH_WTB_PENDING || s->state == NGH_WTB_READY) {
+        s->state = NGH_WTB_CLOSED;
+    }
     wtb_op_push(ctx, WTB_OP_SESSION_DESTROY, s, NULL, 0, NULL);
     wtb_mutex_unlock(&ctx->lock);
     wtb_wake(ctx);
@@ -1192,6 +1210,7 @@ int ngh_wtb_stream_write(ngh_wtb_stream* st, const uint8_t* data, size_t len)
     }
     wtb_mutex_lock(&st->s->ctx->lock);
     if (!st->finish_requested && !st->reset_received &&
+        (st->bidi || st->is_local) && /* a peer's uni stream is receive-only */
         st->s->state == NGH_WTB_READY) {
         size_t room = (st->sendq.bytes < WTB_STREAM_SENDQ_MAX) ?
             WTB_STREAM_SENDQ_MAX - st->sendq.bytes : 0;
@@ -1212,14 +1231,20 @@ int ngh_wtb_stream_write(ngh_wtb_stream* st, const uint8_t* data, size_t len)
 
 int ngh_wtb_stream_finish(ngh_wtb_stream* st)
 {
+    int ret = NGH_WTB_ERR;
     if (st == NULL) {
         return NGH_WTB_ERR;
     }
     wtb_mutex_lock(&st->s->ctx->lock);
-    st->finish_requested = 1;
+    if ((st->bidi || st->is_local) && !st->reset_received) {
+        st->finish_requested = 1;
+        ret = 0;
+    }
     wtb_mutex_unlock(&st->s->ctx->lock);
-    wtb_wake(st->s->ctx);
-    return 0;
+    if (ret == 0) {
+        wtb_wake(st->s->ctx);
+    }
+    return ret;
 }
 
 int ngh_wtb_stream_read(ngh_wtb_stream* st, uint8_t* buf, size_t cap)
@@ -1251,6 +1276,9 @@ void ngh_wtb_stream_reset(ngh_wtb_stream* st, uint32_t error_code)
         return;
     }
     wtb_mutex_lock(&st->s->ctx->lock);
+    /* dead both ways from the caller's point of view, immediately */
+    st->reset_received = 1;
+    wtb_queue_clear(&st->sendq);
     wtb_op_push(st->s->ctx, WTB_OP_STREAM_RESET, st->s, st, error_code, NULL);
     wtb_mutex_unlock(&st->s->ctx->lock);
     wtb_wake(st->s->ctx);
