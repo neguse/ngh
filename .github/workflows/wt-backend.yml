@@ -1,0 +1,116 @@
+# Builds the ngh_wt_backend shared library (the desktop backend of
+# ngh_webtransport.h) on every push, and attaches the binaries to a release
+# when a wt-backend-v* tag is pushed. macOS follows once the backend is
+# ported there.
+#
+# Windows links OpenSSL statically (vcpkg x64-windows-static-md) so the
+# resulting DLL has no runtime dependency beyond the CRT; Linux builds on
+# the oldest supported LTS to keep the glibc floor low for prebuilt users.
+
+name: wt-backend
+
+on:
+  push:
+    branches: [main]
+    tags: ["wt-backend-v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04
+            artifact: build/libngh_wt_backend.so
+            test_bin: build/test_wt
+            client_bin: build/ngh_wt_echo
+          - name: windows-x64
+            os: windows-2022
+            artifact: build/Release/ngh_wt_backend.dll
+            test_bin: build/Release/test_wt.exe
+            client_bin: build/Release/ngh_wt_echo.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # picotls's CMake does FIND_PACKAGE(PkgConfig REQUIRED)
+          choco install pkgconfiglite --no-progress -y
+          vcpkg install openssl:x64-windows-static-md
+          $toolchain = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          $args = "-DCMAKE_TOOLCHAIN_FILE=$toolchain -DVCPKG_TARGET_TRIPLET=x64-windows-static-md"
+          "NGH_PICOQUIC_CMAKE_ARGS=$args" >> $env:GITHUB_ENV
+          "NGH_TOOLCHAIN_ARGS=$args" >> $env:GITHUB_ENV
+
+      # For the interop echo server (tests/wt-echo, Rust).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/wt-echo
+
+      - name: Build picoquic (pinned + patched)
+        run: python scripts/fetch_picoquic.py
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON ${{ env.NGH_TOOLCHAIN_ARGS }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target ngh_wt_backend ngh_wt_backend_check test_wt ngh_wt_echo
+
+      # test_wt loads the backend from beside the test binary and exercises
+      # the failure paths. Run the binary directly rather than through
+      # ctest: its "backend missing" exit (77) must fail this job, not
+      # count as a skipped test.
+      - name: Test
+        shell: bash
+        run: ./${{ matrix.test_bin }}
+
+      # The real proof: a full echo round-trip (session with a pinned
+      # certificate, datagram, bidi stream, capsule close) against the
+      # quinn-based wtransport echo server on localhost.
+      - name: Interop test
+        shell: bash
+        run: python tests/wt_interop.py ./${{ matrix.client_bin }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ngh_wt_backend-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/wt-backend-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      # Asset names carry the platform; a fetch script downloads and strips
+      # the suffix back to the loader's expected file name.
+      - name: Name assets per platform
+        run: |
+          mv dist/ngh_wt_backend-linux-x64/libngh_wt_backend.so \
+             dist/libngh_wt_backend-linux-x64.so
+          mv dist/ngh_wt_backend-windows-x64/ngh_wt_backend.dll \
+             dist/ngh_wt_backend-windows-x64.dll
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/libngh_wt_backend-linux-x64.so
+            dist/ngh_wt_backend-windows-x64.dll

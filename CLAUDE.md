@@ -1,8 +1,9 @@
 # ngh
 
-Header-only C libraries. Currently one: `ngh_mediapipe.h` (MediaPipe face/pose
-tracking, Windows/Linux/macOS/Web). CMake exists only for tests and examples;
-the headers themselves need nothing.
+Header-only C libraries: `ngh_mediapipe.h` (MediaPipe face/pose tracking,
+Windows/Linux/macOS/Web) and `ngh_webtransport.h` (WebTransport client,
+Linux/Web now, Windows next). CMake exists only for tests, examples and the
+webtransport backend library; the headers themselves need nothing.
 
 ## Decisions
 
@@ -44,6 +45,16 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   with scale absorbed upstream (always ~1.0); pose world is y-DOWN/+z-away
   metres at the hip origin; normalized z is width-scaled, negative = closer.
   ngh does not do mirroring, smoothing or retargeting -- consumer's call.
+- `ngh_webtransport.h`: WebTransport client. Backend is picoquic
+  (tag-pinned), compiled by GitHub Actions into a shim shared library that
+  exports only an ngh-designed ABI — picoquic's own API never crosses it.
+  Binaries attach to ngh Releases; a fetch script downloads them with SHA256
+  pinning. v1 is client-only, but the shim ABI must not preclude adding a
+  server role later. Web + Linux + Windows ship as one set; macOS follows.
+  Server side: wtransport (Rust/quinn) is the first-candidate production
+  server (chosen for performance). ctest uses picoquic's own demo server as
+  the reference, plus one cross-stack interop test against wtransport —
+  same-stack-only testing would let draft-interpretation bugs cancel out.
 - `vendor/` is fetched by `scripts/fetch_*.py`, never committed. Third-party
   notice obligations are in `THIRDPARTY.md` — the MediaPipe wheel's LICENSE
   does not carry the notices for its statically linked BSD/zlib dependencies.
@@ -66,6 +77,29 @@ Recorded so they don't get relitigated. Change only with a stated reason.
 - Intended consumer: `../lub` (SDL3 submodule, release-3.2.30). CI's
   FetchContent pin for the camera example must track lub's SDL tag.
 - Linux GPU delegate needs `EGL_PLATFORM=surfaceless` when headless.
+- WebTransport backend (2026-08): backend/wt_backend.{h,c} is the shim ABI
+  and its picoquic implementation. scripts/fetch_picoquic.py stages the
+  pinned picoquic (467cb81) with backend/picoquic_wt_compat.patch, which
+  drops picoquic's hard requirement on the peer's RESET_STREAM_AT transport
+  parameter (WT draft-13) -- quinn/quic-go era servers do not implement it.
+  Verified against wtransport 0.7.1 on localhost (build/ngh_wt_backend_check
+  <url> <cert_sha256_hex>): session accept, datagram echo, bidi stream echo,
+  capsule close, and rejection of a wrong cert pin. Pinning is
+  serverCertificateHashes-style SHA-256 plus a real CertificateVerify
+  signature check (OpenSSL EVP); CA-store verification is unimplemented, so
+  connect() requires cert_hashes. h3zero quirk: joint data+FIN arrives as
+  one post_fin callback with length > 0 -- consume bytes there too.
+  Cross-stack interop is a ctest: `cmake -B build -DNGH_WT_INTEROP=ON`
+  runs tests/wt_interop.py (wtransport echo server in tests/wt-echo,
+  needs cargo). The wt-backend workflow runs the full round-trip on both
+  Linux and Windows CI (vcpkg static OpenSSL on Windows): pinned-cert
+  session, datagram echo, bidi stream echo, capsule close. The
+  picotls/picoquic CMake path is unmaintained upstream on Windows (they
+  ship VS projects): the gaps are patched in scripts/fetch_picoquic.py
+  (pkg-config, wincompat.h include path, /FIws2tcpip.h) and CMakeLists
+  (compile picotlsvs wintimeofday.c into the backend, link bcrypt).
+  Releases: push a `wt-backend-v*` tag and the workflow attaches the
+  per-platform binaries.
 - Verified in a real browser (Safari, 2026-07): full demo works and the GPU
   delegate is used, no CPU fallback needed. Demo deploy: scratchpad cfdemo/ ->
   `npx wrangler deploy` -> https://ngh-demo.negcee.workers.dev (temporary;

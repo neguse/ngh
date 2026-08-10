@@ -73,6 +73,64 @@ if(NGH_HAVE_TESTDATA AND NOT EMSCRIPTEN)
     endif()
 endif()
 
+# -------------------------------------------------- webtransport backend --
+# Prebuilt shim for ngh_webtransport.h. scripts/fetch_picoquic.py stages the
+# pinned, patched picoquic; without it this section is skipped silently.
+
+set(NGH_PICOQUIC "${CMAKE_CURRENT_SOURCE_DIR}/vendor/picoquic")
+if(EXISTS "${NGH_PICOQUIC}/.ngh_built" AND NOT EMSCRIPTEN)
+    find_package(OpenSSL REQUIRED)
+    find_package(Threads REQUIRED)
+    add_library(ngh_wt_backend SHARED backend/wt_backend.c)
+    target_include_directories(ngh_wt_backend PRIVATE
+        "${NGH_PICOQUIC}/picoquic"
+        "${NGH_PICOQUIC}/picohttp"
+        "${NGH_PICOQUIC}/build/_deps/picotls-src/include")
+    target_link_directories(ngh_wt_backend PRIVATE
+        "${NGH_PICOQUIC}/build"
+        "${NGH_PICOQUIC}/build/_deps/picotls-build"
+        # Multi-config generators (MSVC) nest the archives one level deeper.
+        "${NGH_PICOQUIC}/build/Release"
+        "${NGH_PICOQUIC}/build/_deps/picotls-build/Release")
+    # The list repeats because picoquic-core and picoquic-log are mutually
+    # referential static archives.
+    target_link_libraries(ngh_wt_backend PRIVATE
+        picohttp-core picoquic-log picoquic-core
+        picohttp-core picoquic-log picoquic-core
+        picotls-openssl picotls-fusion picotls-minicrypto picotls-core
+        OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    find_library(NGH_BROTLI_DEC brotlidec)
+    find_library(NGH_BROTLI_ENC brotlienc)
+    if(NGH_BROTLI_DEC AND NGH_BROTLI_ENC)
+        target_link_libraries(ngh_wt_backend PRIVATE
+            ${NGH_BROTLI_DEC} ${NGH_BROTLI_ENC})
+    endif()
+    if(WIN32)
+        # wintimeofday lives in picotls's Visual Studio tree only; its
+        # CMake build never compiles it. bcrypt backs minicrypto's RNG.
+        target_sources(ngh_wt_backend PRIVATE
+            "${NGH_PICOQUIC}/build/_deps/picotls-src/picotlsvs/picotls/wintimeofday.c")
+        target_link_libraries(ngh_wt_backend PRIVATE ws2_32 iphlpapi bcrypt)
+    else()
+        target_link_libraries(ngh_wt_backend PRIVATE ${CMAKE_DL_LIBS} m)
+    endif()
+    if(NOT WIN32 AND NOT APPLE)
+        # Keep picoquic's symbols out of the shared library's export table.
+        target_link_options(ngh_wt_backend PRIVATE "LINKER:--exclude-libs,ALL")
+    endif()
+    set_target_properties(ngh_wt_backend PROPERTIES
+        C_VISIBILITY_PRESET hidden
+        POSITION_INDEPENDENT_CODE ON)
+
+    add_executable(ngh_wt_backend_check backend/wt_backend_check.c)
+    target_include_directories(ngh_wt_backend_check PRIVATE backend)
+    target_link_libraries(ngh_wt_backend_check PRIVATE ngh_wt_backend)
+    target_compile_options(ngh_wt_backend_check PRIVATE ${NGH_WARNINGS})
+else()
+    message(STATUS
+        "ngh: skipping ngh_wt_backend -- run scripts/fetch_picoquic.py first")
+endif()
+
 # ---------------------------------------------------------------- tests --
 
 if(NGH_BUILD_TESTS)
@@ -102,10 +160,48 @@ if(NGH_BUILD_TESTS)
             LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
         add_test(NAME test_space
                  COMMAND node $<TARGET_FILE:test_space>)
+
+        add_executable(test_wt_web tests/test_wt_web.c)
+        target_link_libraries(test_wt_web PRIVATE ngh)
+        target_include_directories(test_wt_web PRIVATE tests)
+        target_compile_options(test_wt_web PRIVATE ${NGH_WARNINGS})
+        set_target_properties(test_wt_web PROPERTIES
+            SUFFIX ".js"
+            LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
+        add_test(NAME test_wt_web
+                 COMMAND node $<TARGET_FILE:test_wt_web>)
     else()
         ngh_add_program(test_abi tests/test_abi.c)
         target_include_directories(test_abi PRIVATE tests)
         add_test(NAME test_abi COMMAND test_abi)
+
+        # Needs the backend library next to the test binary; exits 77
+        # (skip) when it is absent.
+        ngh_add_program(test_wt tests/test_wt.c)
+        target_include_directories(test_wt PRIVATE tests)
+        add_test(NAME test_wt COMMAND test_wt)
+        set_tests_properties(test_wt PROPERTIES SKIP_RETURN_CODE 77)
+
+        # Cross-stack interop: our picoquic client against a quinn-based
+        # wtransport echo server (tests/wt-echo, Rust). Opt-in because it
+        # compiles a cargo project and opens a localhost UDP port.
+        option(NGH_WT_INTEROP
+            "Enable the WebTransport cross-stack interop test (needs cargo)"
+            OFF)
+        if(NGH_WT_INTEROP)
+            if(NOT NGH_BUILD_EXAMPLES)
+                message(FATAL_ERROR
+                    "NGH_WT_INTEROP runs the ngh_wt_echo example; enable "
+                    "NGH_BUILD_EXAMPLES")
+            endif()
+            find_program(NGH_CARGO cargo REQUIRED)
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            add_test(NAME test_wt_interop
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/wt_interop.py
+                             $<TARGET_FILE:ngh_wt_echo>)
+            set_tests_properties(test_wt_interop PROPERTIES TIMEOUT 700)
+        endif()
 
         if(NGH_HAVE_TESTDATA)
             foreach(t test_golden test_api test_space)
@@ -130,6 +226,7 @@ endif()
 
 if(NGH_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
     ngh_add_program(ngh_game_loop examples/desktop/game_loop.c)
+    ngh_add_program(ngh_wt_echo examples/desktop/wt_echo.c)
     if(NGH_HAVE_TESTDATA)
         ngh_add_program(ngh_still_image examples/desktop/still_image.c)
         target_link_libraries(ngh_still_image PRIVATE ngh_stb_image)

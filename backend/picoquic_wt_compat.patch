@@ -1,0 +1,16 @@
+diff --git a/picohttp/webtransport.c b/picohttp/webtransport.c
+index fb49cd6..b79d7e8 100644
+--- a/picohttp/webtransport.c
++++ b/picohttp/webtransport.c
+@@ -363,8 +363,9 @@ static int picowt_webtransport_requirements_met(picoquic_cnx_t* cnx, h3zero_call
+         has_webtransport_settings &&
+         has_connect_settings &&
+         remote_tp != NULL &&
+-        remote_tp->max_datagram_frame_size > 0 &&
+-        remote_tp->is_reset_stream_at_enabled;
++        remote_tp->max_datagram_frame_size > 0;
++        /* ngh: the RESET_STREAM_AT requirement (WT draft-13) is dropped --
++         * quinn/quic-go era servers do not implement that QUIC extension. */
+ }
+ 
+ static int picowt_format_connect_frame(h3zero_stream_ctx_t* stream_ctx,
