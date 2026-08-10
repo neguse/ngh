@@ -28,10 +28,12 @@ jobs:
             os: ubuntu-22.04
             artifact: build/libngh_wt_backend.so
             test_bin: build/test_wt
+            client_bin: build/ngh_wt_echo
           - name: windows-x64
             os: windows-2022
             artifact: build/Release/ngh_wt_backend.dll
             test_bin: build/Release/test_wt.exe
+            client_bin: build/Release/ngh_wt_echo.exe
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,14 +56,19 @@ jobs:
           "NGH_PICOQUIC_CMAKE_ARGS=$args" >> $env:GITHUB_ENV
           "NGH_TOOLCHAIN_ARGS=$args" >> $env:GITHUB_ENV
 
+      # For the interop echo server (tests/wt-echo, Rust).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/wt-echo
+
       - name: Build picoquic (pinned + patched)
-        run: python3 scripts/fetch_picoquic.py
+        run: python scripts/fetch_picoquic.py
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON -DNGH_BUILD_EXAMPLES=OFF ${{ env.NGH_TOOLCHAIN_ARGS }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON ${{ env.NGH_TOOLCHAIN_ARGS }}
 
       - name: Build
-        run: cmake --build build --config Release --parallel --target ngh_wt_backend ngh_wt_backend_check test_wt
+        run: cmake --build build --config Release --parallel --target ngh_wt_backend ngh_wt_backend_check test_wt ngh_wt_echo
 
       # test_wt loads the backend from beside the test binary and exercises
       # the failure paths. Run the binary directly rather than through
@@ -70,6 +77,13 @@ jobs:
       - name: Test
         shell: bash
         run: ./${{ matrix.test_bin }}
+
+      # The real proof: a full echo round-trip (session with a pinned
+      # certificate, datagram, bidi stream, capsule close) against the
+      # quinn-based wtransport echo server on localhost.
+      - name: Interop test
+        shell: bash
+        run: python tests/wt_interop.py ./${{ matrix.client_bin }}
 
       - uses: actions/upload-artifact@v4
         with:
