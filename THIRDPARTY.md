@@ -69,7 +69,28 @@ Served from `https://storage.googleapis.com/mediapipe-models/.../latest/...`.
 That path is mutable, so `scripts/fetch_models.py` records the digests ngh was
 tested against and reports a change rather than failing.
 
-## Test-only dependencies
+## WebTransport backend — `ngh_wt_backend.{so,dll}`
+
+Built from source by `scripts/fetch_picoquic.py` + CMake (and prebuilt by
+the `wt-backend` workflow for releases). The shared library statically
+links:
+
+| component | licence |
+|---|---|
+| picoquic (pinned, one-line patch in `backend/`) | MIT, © Private Octopus |
+| picotls | MIT, © Kazuho Oku, DeNA Co., Ltd. and contributors |
+| cifra (picotls minicrypto) | CC0 1.0 (public-domain dedication) |
+| micro-ecc (picotls minicrypto) | BSD-2-Clause, © 2014 Kenneth MacKay |
+| OpenSSL 3 | Apache-2.0 — **Windows build only** |
+
+micro-ecc's BSD-2-Clause requires its copyright notice and disclaimer in
+the documentation of any binary redistribution, and MIT requires the
+licence text to accompany copies — if you ship the backend binary, carry
+those notices yourself; no upstream file collects them for you.
+
+The Linux build does not embed OpenSSL: it loads the system
+`libssl`/`libcrypto` (and brotli, via picotls's certificate compression)
+dynamically, which carries no notice obligation here.
 
 Not part of ngh and never shipped with it.
 
