@@ -91,9 +91,9 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   one post_fin callback with length > 0 -- consume bytes there too.
   Cross-stack interop is a ctest: `cmake -B build -DNGH_WT_INTEROP=ON`
   runs tests/wt_interop.py (wtransport echo server in tests/wt-echo,
-  needs cargo). Windows is CI-verified (wt-backend workflow builds the
-  DLL with vcpkg static OpenSSL and runs test_wt's load/failure paths);
-  the full echo round-trip has only run on Linux so far. The
+  needs cargo). The wt-backend workflow runs the full round-trip on both
+  Linux and Windows CI (vcpkg static OpenSSL on Windows): pinned-cert
+  session, datagram echo, bidi stream echo, capsule close. The
   picotls/picoquic CMake path is unmaintained upstream on Windows (they
   ship VS projects): the gaps are patched in scripts/fetch_picoquic.py
   (pkg-config, wincompat.h include path, /FIws2tcpip.h) and CMakeLists
