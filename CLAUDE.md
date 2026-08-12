@@ -55,9 +55,34 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   server (chosen for performance). ctest uses picoquic's own demo server as
   the reference, plus one cross-stack interop test against wtransport —
   same-stack-only testing would let draft-interpretation bugs cancel out.
+- `ngh_http.h`: plain HTTP client. The API is HTTP's semantic layer only
+  (fetch model: method/url/headers/status/body; no reason phrase, no
+  connection/keep-alive knobs, header names lowercased) so the wire
+  version can move underneath — `version` is a hint, reality via
+  ngh_http_version(), mirroring the `accel` decision. v1 is one-shot
+  buffered only: PENDING → DONE/ERROR, whole body in memory capped by
+  max_body_len. Streaming was dropped because backpressure is the most
+  backend-divergent machinery (curl_easy_pause quirks, NSURLSession has no
+  delegate flow control); chunked reads and upload sources are additive
+  later (new option field + state + read()) without breaking the API. Backends are the
+  platform HTTP stacks, resolved at run time: fetch() (web), WinHTTP
+  (Windows), NSURLSession (macOS, and iOS which is planned scope), dlopen
+  libcurl (Linux). Nothing ships, CVE response stays with the OS vendors.
+  Bundling curl was weighed and deferred: curl 8.15 dropped the Secure
+  Transport backend, so on Apple it would mean shipping a TLS library too —
+  a patch treadmill against a general-web threat model, unlike wt_backend's
+  OpenSSL which only ever talks to cert-pinned own infra. Revisit only on a
+  concrete native-backend defect; consumers needing one behavior everywhere
+  can pass their own libcurl to ngh_http_runtime_load(). Uniform behavior
+  is enforced by running one contract test matrix against a local server on
+  every platform (the WT-interop style), not by a single implementation.
 - `vendor/` is fetched by `scripts/fetch_*.py`, never committed. Third-party
   notice obligations are in `THIRDPARTY.md` — the MediaPipe wheel's LICENSE
   does not carry the notices for its statically linked BSD/zlib dependencies.
+
+- Guards for conditions that cannot occur (overflow of sizes the platform
+  already bounds, etc.) are asserts or absent, never runtime error
+  branches. Runtime error paths are reserved for reachable failures.
 
 - Documentation lives in the header, stb-style: the top comment of
   ngh_mediapipe.h is the user manual and travels with the copied file.
@@ -100,6 +125,14 @@ Recorded so they don't get relitigated. Change only with a stated reason.
   (compile picotlsvs wintimeofday.c into the backend, link bcrypt).
   Releases: push a `wt-backend-v*` tag and the workflow attaches the
   per-platform binaries.
+- ngh_http.h (2026-08): implemented backends are Linux (dlopen libcurl, one
+  worker thread per request, curl easy API) and Web (EM_JS fetch);
+  Windows/Apple are loud stubs still. Contract test: tests/test_http.c
+  against tests/http_server.py via tests/http_contract.py (ctest test_http),
+  13 cases green, ASan/UBSan/TSan clean. Web verified as far as node goes:
+  plain-emcc link (no extra flags needed, keepalive-exported malloc) plus a
+  wiring smoke run; a live browser round-trip is unverified, as is a real
+  TLS/h2/h3 endpoint (the local test server is h1 plaintext).
 - Verified in a real browser (Safari, 2026-07): full demo works and the GPU
   delegate is used, no CPU fallback needed. Demo deploy: scratchpad cfdemo/ ->
   `npx wrangler deploy` -> https://ngh-demo.negcee.workers.dev (temporary;
