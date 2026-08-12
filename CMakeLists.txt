@@ -182,6 +182,21 @@ if(NGH_BUILD_TESTS)
         add_test(NAME test_wt COMMAND test_wt)
         set_tests_properties(test_wt PROPERTIES SKIP_RETURN_CODE 77)
 
+        # ngh_http.h contract test: one matrix against a stdlib-python
+        # localhost server, run identically on every platform.
+        ngh_add_program(test_http tests/test_http.c)
+        target_include_directories(test_http PRIVATE tests)
+        find_package(Python3 QUIET COMPONENTS Interpreter)
+        if(Python3_FOUND)
+            add_test(NAME test_http
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/http_contract.py
+                             $<TARGET_FILE:test_http>)
+            set_tests_properties(test_http PROPERTIES TIMEOUT 300)
+        else()
+            message(STATUS "ngh: skipping test_http -- python3 not found")
+        endif()
+
         # Cross-stack interop: our picoquic client against a quinn-based
         # wtransport echo server (tests/wt-echo, Rust). Opt-in because it
         # compiles a cargo project and opens a localhost UDP port.
