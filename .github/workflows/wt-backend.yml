@@ -48,11 +48,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # picotls's CMake does FIND_PACKAGE(PkgConfig REQUIRED)
-          choco install pkgconfiglite --no-progress -y
-          vcpkg install openssl:x64-windows-static-md
+          # picotls's CMake does FIND_PACKAGE(PkgConfig REQUIRED); vcpkg's
+          # pkgconf satisfies it (the chocolatey feed 503s too often to rely
+          # on). pwsh does not stop on native-command failure, so check.
+          vcpkg install pkgconf:x64-windows openssl:x64-windows-static-md
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          $pkgconf = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/tools/pkgconf/pkgconf.exe"
+          if (!(Test-Path $pkgconf)) { throw "pkgconf.exe not found at $pkgconf" }
           $toolchain = "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          $args = "-DCMAKE_TOOLCHAIN_FILE=$toolchain -DVCPKG_TARGET_TRIPLET=x64-windows-static-md"
+          $args = "-DCMAKE_TOOLCHAIN_FILE=$toolchain -DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DPKG_CONFIG_EXECUTABLE=$pkgconf"
           "NGH_PICOQUIC_CMAKE_ARGS=$args" >> $env:GITHUB_ENV
           "NGH_TOOLCHAIN_ARGS=$args" >> $env:GITHUB_ENV
 
