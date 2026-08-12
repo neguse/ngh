@@ -656,6 +656,15 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* 77 is the automake "skipped" convention, matching the other tests:
+     * platforms whose backend is a stub (or a Linux without libcurl)
+     * cannot run the contract. */
+    if (ngh_http_runtime_load(NULL) != 0) {
+        const char *why = ngh_http_last_error();
+        printf("SKIP: %s\n", why ? why : "no HTTP backend");
+        return 77;
+    }
+
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         detail[0] = '\0';
         case_deadline_ms = now_ms() + CASE_TIMEOUT_MS;

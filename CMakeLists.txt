@@ -192,7 +192,8 @@ if(NGH_BUILD_TESTS)
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/http_contract.py
                              $<TARGET_FILE:test_http>)
-            set_tests_properties(test_http PROPERTIES TIMEOUT 300)
+            set_tests_properties(test_http PROPERTIES TIMEOUT 300
+                                 SKIP_RETURN_CODE 77)
         else()
             message(STATUS "ngh: skipping test_http -- python3 not found")
         endif()
