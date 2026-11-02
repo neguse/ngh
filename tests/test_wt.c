@@ -65,6 +65,44 @@ static void test_missing_cert_hash(void) {
     NGH_CHECK(ngh_wt_last_error() != NULL);
 }
 
+static void test_url_parsing(void) {
+    static const char *good[] = {
+        "https://[::1]:9/",      /* IPv6 literal, browser syntax */
+        "https://[::1]/",        /* default port */
+        "https://127.0.0.1:9",   /* no path */
+        "https://127.0.0.1:9?x=1", /* query without a path */
+        "https://example.invalid:9/a/b?c#d",
+    };
+    static const char *bad[] = {
+        "http://127.0.0.1:9/",   /* not https */
+        "https://::1:9/",        /* unbracketed IPv6 */
+        "https://[::1:9/",       /* unclosed bracket */
+        "https://[::1]x/",       /* junk after the bracket */
+        "https://127.0.0.1:/",   /* empty port */
+        "https://127.0.0.1:12ab/", "https://127.0.0.1:70000/",
+        "https://127.0.0.1:0/",  "https://:443/", "https://u@host/",
+    };
+    ngh_wt_options opt = ngh_wt_options_default();
+    size_t i;
+    opt.cert_hashes = dummy_hash;
+    opt.cert_hash_count = 1;
+    opt.connect_timeout_ms = 200;
+    for (i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+        ngh_wt *wt = ngh_wt_connect(good[i], &opt);
+        if (!wt) printf("    rejected %s: %s\n", good[i], ngh_wt_last_error());
+        NGH_CHECK(wt != NULL);
+        ngh_wt_destroy(wt);
+    }
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        ngh_wt *wt = ngh_wt_connect(bad[i], &opt);
+        if (wt) printf("    accepted %s\n", bad[i]);
+        NGH_CHECK(wt == NULL);
+        NGH_CHECK(ngh_wt_last_error() != NULL &&
+                  strstr(ngh_wt_last_error(), "malformed") != NULL);
+        ngh_wt_destroy(wt);
+    }
+}
+
 int main(void) {
     test_args();
 
@@ -73,6 +111,7 @@ int main(void) {
         return 77;
     }
     test_missing_cert_hash();
+    test_url_parsing();
     test_connect_failure();
 
     return ngh_test_report("test_wt");

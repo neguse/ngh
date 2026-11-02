@@ -89,6 +89,9 @@
  * Sizes, orderings, edge semantics
  * ==========================================================================
  *
+ * - URLs are https://host[:port][/path][?query], as in the browser; IPv6
+ *   literals go in brackets (https://[::1]:4433/). The fragment is dropped,
+ *   and an IP-literal host sends no SNI.
  * - ngh_wt_dgram_max() is the largest payload ngh_wt_dgram_send accepts;
  *   0 while not READY. Receiving into a buffer smaller than the datagram
  *   returns NGH_WT_ERR_SIZE and drops that datagram (datagram semantics).

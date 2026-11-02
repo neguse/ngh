@@ -241,6 +241,7 @@ struct ngh_wtb_session {
     int port;
     char* path;
     char* authority;
+    int is_literal; /* host is an IP address: no SNI (RFC 6066) */
     uint8_t* pins; /* pin_count concatenated 32-byte digests */
     size_t pin_count;
     uint32_t idle_timeout_ms;
@@ -780,7 +781,8 @@ static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
     picoquic_set_default_idle_timeout(ctx->quic,
         (s->idle_timeout_ms != 0) ? s->idle_timeout_ms : 30000);
     if (picowt_prepare_client_cnx(ctx->quic, (struct sockaddr*)&s->addr,
-            &s->cnx, &s->h3, &s->control, now, s->host) != 0) {
+            &s->cnx, &s->h3, &s->control, now,
+            s->is_literal ? NULL : s->host) != 0) {
         wtb_session_fail(s, "connection setup failed");
         return;
     }
@@ -1133,50 +1135,140 @@ const char* ngh_wtb_ctx_error(ngh_wtb_ctx* ctx)
     return (ctx != NULL && ctx->err[0] != 0) ? ctx->err : NULL;
 }
 
+/* Dotted-quad check without inet_pton, which Windows hides behind
+ * ws2tcpip.h feature macros. */
+static int wtb_is_ipv4_literal(const char* host)
+{
+    int parts = 0;
+    while (*host != 0) {
+        int digits = 0;
+        int value = 0;
+        while (*host >= '0' && *host <= '9') {
+            value = value * 10 + (*host - '0');
+            host++;
+            if (++digits > 3 || value > 255) {
+                return 0;
+            }
+        }
+        if (digits == 0) {
+            return 0;
+        }
+        parts++;
+        if (*host == '.') {
+            host++;
+            if (*host == 0) {
+                return 0;
+            }
+        }
+        else if (*host != 0) {
+            return 0;
+        }
+    }
+    return parts == 4;
+}
+
+/* Splits "https://host[:port][/path][?query][#fragment]" into host, port,
+ * path (query kept, fragment dropped) and the :authority to send. host may
+ * be an IPv6 literal in brackets ("https://[::1]:4433/"), as in browsers.
+ * Rejects anything else rather than guessing: a bad port, an unbracketed
+ * IPv6 address, an empty host. */
 static int wtb_parse_url(ngh_wtb_session* s, const char* url)
 {
-    const char* p;
+    const char* auth;
+    const char* auth_end;
     const char* host_start;
     const char* host_end;
-    const char* path_start;
+    const char* port_start = NULL;
+    const char* path;
     size_t host_len;
+    int bracketed = 0;
 
     if (url == NULL || strncmp(url, "https://", 8) != 0) {
         return -1;
     }
-    host_start = url + 8;
-    path_start = strchr(host_start, '/');
-    if (path_start == NULL) {
-        path_start = host_start + strlen(host_start);
-    }
-    p = memchr(host_start, ':', (size_t)(path_start - host_start));
-    if (p != NULL) {
-        host_end = p;
-        s->port = atoi(p + 1);
-        if (s->port <= 0 || s->port > 65535) {
+    auth = url + 8;
+    auth_end = auth + strcspn(auth, "/?#");
+    if (*auth == '[') {
+        const char* close = memchr(auth, ']', (size_t)(auth_end - auth));
+        if (close == NULL) {
             return -1;
+        }
+        bracketed = 1;
+        host_start = auth + 1;
+        host_end = close;
+        if (close + 1 < auth_end) {
+            if (close[1] != ':') {
+                return -1;
+            }
+            port_start = close + 2;
         }
     }
     else {
-        host_end = path_start;
-        s->port = 443;
+        const char* colon = memchr(auth, ':', (size_t)(auth_end - auth));
+        host_start = auth;
+        host_end = (colon != NULL) ? colon : auth_end;
+        if (colon != NULL) {
+            port_start = colon + 1;
+        }
     }
     host_len = (size_t)(host_end - host_start);
-    if (host_len == 0) {
+    if (host_len == 0 || memchr(host_start, '@', host_len) != NULL) {
         return -1;
     }
+    if (!bracketed && memchr(host_start, ':', host_len) != NULL) {
+        return -1;
+    }
+    s->port = 443;
+    if (port_start != NULL) {
+        const char* p;
+        long port = 0;
+        if (port_start == auth_end) {
+            return -1; /* "host:" */
+        }
+        for (p = port_start; p < auth_end; p++) {
+            if (*p < '0' || *p > '9') {
+                return -1;
+            }
+            port = port * 10 + (*p - '0');
+            if (port > 65535) {
+                return -1;
+            }
+        }
+        if (port == 0) {
+            return -1;
+        }
+        s->port = (int)port;
+    }
+
     s->host = (char*)malloc(host_len + 1);
     if (s->host == NULL) {
         return -1;
     }
     memcpy(s->host, host_start, host_len);
     s->host[host_len] = 0;
-    s->path = strdup((*path_start != 0) ? path_start : "/");
+    s->is_literal = bracketed || wtb_is_ipv4_literal(s->host);
+
+    /* path keeps the query; the fragment never goes on the wire */
+    path = auth_end;
+    {
+        size_t path_len = strcspn(path, "#");
+        int need_slash = (path_len == 0 || path[0] != '/');
+        s->path = (char*)malloc(path_len + 2);
+        if (s->path != NULL) {
+            size_t off = 0;
+            if (need_slash) {
+                s->path[off++] = '/';
+            }
+            memcpy(s->path + off, path, path_len);
+            s->path[off + path_len] = 0;
+        }
+    }
     {
         size_t alen = host_len + 16;
         s->authority = (char*)malloc(alen);
         if (s->authority != NULL) {
-            snprintf(s->authority, alen, "%s:%d", s->host, s->port);
+            snprintf(s->authority, alen, bracketed ? "[%s]:%d" : "%s:%d",
+                s->host, s->port);
         }
     }
     return (s->path != NULL && s->authority != NULL) ? 0 : -1;
