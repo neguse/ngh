@@ -47,15 +47,17 @@ static void wtb_mutex_destroy(wtb_mutex_t* m) { DeleteCriticalSection(m); }
 static void wtb_mutex_lock(wtb_mutex_t* m) { EnterCriticalSection(m); }
 static void wtb_mutex_unlock(wtb_mutex_t* m) { LeaveCriticalSection(m); }
 static void wtb_sleep_ms(unsigned ms) { Sleep(ms); }
+typedef HANDLE wtb_thread_t;
 static DWORD WINAPI wtb_resolver_main(LPVOID arg);
-static int wtb_spawn_resolver(void* arg)
+static int wtb_thread_start(wtb_thread_t* t, void* arg)
 {
-    HANDLE h = CreateThread(NULL, 0, wtb_resolver_main, arg, 0, NULL);
-    if (h == NULL) {
-        return -1;
-    }
-    CloseHandle(h); /* detached: it reports back through the op queue */
-    return 0;
+    *t = CreateThread(NULL, 0, wtb_resolver_main, arg, 0, NULL);
+    return (*t != NULL) ? 0 : -1;
+}
+static void wtb_thread_join(wtb_thread_t t)
+{
+    WaitForSingleObject(t, INFINITE);
+    CloseHandle(t);
 }
 typedef SOCKET wtb_socket_t;
 #define WTB_BAD_SOCKET INVALID_SOCKET
@@ -82,15 +84,15 @@ static void wtb_sleep_ms(unsigned ms)
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
 }
+typedef pthread_t wtb_thread_t;
 static void* wtb_resolver_main(void* arg);
-static int wtb_spawn_resolver(void* arg)
+static int wtb_thread_start(wtb_thread_t* t, void* arg)
 {
-    pthread_t t;
-    if (pthread_create(&t, NULL, wtb_resolver_main, arg) != 0) {
-        return -1;
-    }
-    pthread_detach(t); /* it reports back through the op queue */
-    return 0;
+    return (pthread_create(t, NULL, wtb_resolver_main, arg) == 0) ? 0 : -1;
+}
+static void wtb_thread_join(wtb_thread_t t)
+{
+    (void)pthread_join(t, NULL);
 }
 typedef int wtb_socket_t;
 #define WTB_BAD_SOCKET (-1)
@@ -266,6 +268,16 @@ struct ngh_wtb_session {
     size_t accept_count;
 };
 
+/* One name lookup in flight. Resolver threads are joined, never detached:
+ * a detached thread can still be returning through this library's code
+ * when ngh_wt_runtime_unload() unmaps it. */
+typedef struct wtb_resolver {
+    struct wtb_resolver* next;
+    ngh_wtb_session* s;
+    wtb_thread_t thread;
+    int done; /* the thread has finished touching shared state; under lock */
+} wtb_resolver;
+
 struct ngh_wtb_ctx {
     picoquic_quic_t* quic;
     picoquic_network_thread_ctx_t* net;
@@ -275,7 +287,7 @@ struct ngh_wtb_ctx {
     wtb_op* op_tail;
     ngh_wtb_session* sessions;
     int loop_ready; /* the packet loop opened its sockets; under lock */
-    int resolving;  /* resolver threads still running; under lock */
+    struct wtb_resolver* resolvers; /* not yet joined; under lock */
     int closing;    /* ctx_destroy started: resolvers must not queue ops */
     ptls_verify_certificate_t verifier;
     char err[256];
@@ -696,7 +708,8 @@ static DWORD WINAPI wtb_resolver_main(LPVOID arg)
 static void* wtb_resolver_main(void* arg)
 #endif
 {
-    ngh_wtb_session* s = (ngh_wtb_session*)arg;
+    wtb_resolver* r = (wtb_resolver*)arg;
+    ngh_wtb_session* s = r->s;
     ngh_wtb_ctx* ctx = s->ctx;
     struct sockaddr_storage addr;
     int is_name = 0;
@@ -711,9 +724,7 @@ static void* wtb_resolver_main(void* arg)
         wtb_op_push(ctx, WTB_OP_CONNECT, s, NULL, 0, NULL);
     }
     wtb_wake(ctx);
-    /* Last touch of ctx: once `resolving` drops and the lock is released,
-     * ctx_destroy may free it. */
-    ctx->resolving -= 1;
+    r->done = 1;
     wtb_session_unref(s);
     wtb_mutex_unlock(&ctx->lock);
 #if defined(_WIN32)
@@ -721,6 +732,36 @@ static void* wtb_resolver_main(void* arg)
 #else
     return NULL;
 #endif
+}
+
+/* Under ctx->lock: unlinks the finished resolvers (all of them when `all`)
+ * and returns them for wtb_join_resolvers, which runs without the lock. */
+static wtb_resolver* wtb_take_resolvers(ngh_wtb_ctx* ctx, int all)
+{
+    wtb_resolver* out = NULL;
+    wtb_resolver** pp = &ctx->resolvers;
+    while (*pp != NULL) {
+        wtb_resolver* r = *pp;
+        if (all || r->done) {
+            *pp = r->next;
+            r->next = out;
+            out = r;
+        }
+        else {
+            pp = &r->next;
+        }
+    }
+    return out;
+}
+
+static void wtb_join_resolvers(wtb_resolver* r)
+{
+    while (r != NULL) {
+        wtb_resolver* next = r->next;
+        wtb_thread_join(r->thread);
+        free(r);
+        r = next;
+    }
 }
 
 static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
@@ -1047,13 +1088,15 @@ void ngh_wtb_ctx_destroy(ngh_wtb_ctx* ctx)
     }
     /* Resolver threads hold ctx->lock and session references; getaddrinfo
      * cannot be cancelled, so wait them out before tearing anything down. */
-    wtb_mutex_lock(&ctx->lock);
-    ctx->closing = 1;
-    while (ctx->resolving > 0) {
-        wtb_mutex_unlock(&ctx->lock);
-        wtb_sleep_ms(1);
+    {
+        wtb_resolver* all;
         wtb_mutex_lock(&ctx->lock);
+        ctx->closing = 1;
+        all = wtb_take_resolvers(ctx, 1);
+        wtb_mutex_unlock(&ctx->lock);
+        wtb_join_resolvers(all);
     }
+    wtb_mutex_lock(&ctx->lock);
     for (s = ctx->sessions; s != NULL; s = s->next) {
         if (s->cnx != NULL &&
             picoquic_get_cnx_state(s->cnx) != picoquic_state_disconnected) {
@@ -1143,6 +1186,8 @@ ngh_wtb_session* ngh_wtb_connect(ngh_wtb_ctx* ctx, const char* url,
     const ngh_wtb_options* opt)
 {
     ngh_wtb_session* s;
+    wtb_resolver* r;
+    wtb_resolver* finished;
 
     if (ctx == NULL) {
         return NULL;
@@ -1190,17 +1235,29 @@ ngh_wtb_session* ngh_wtb_connect(ngh_wtb_ctx* ctx, const char* url,
     s->connect_deadline = picoquic_current_time() +
         (uint64_t)s->connect_timeout_ms * 1000;
 
+    r = (wtb_resolver*)calloc(1, sizeof(wtb_resolver));
     wtb_mutex_lock(&ctx->lock);
+    finished = wtb_take_resolvers(ctx, 0);
     s->next = ctx->sessions;
     ctx->sessions = s;
-    s->refs += 1; /* the resolver's */
-    ctx->resolving += 1;
-    if (wtb_spawn_resolver(s) != 0) {
-        s->refs -= 1;
-        ctx->resolving -= 1;
-        wtb_session_fail(s, "cannot start the name resolver");
+    if (r == NULL) {
+        wtb_session_fail(s, "out of memory");
+    }
+    else {
+        r->s = s;
+        s->refs += 1; /* the resolver's */
+        /* linked before the thread starts: its last act takes this lock */
+        r->next = ctx->resolvers;
+        ctx->resolvers = r;
+        if (wtb_thread_start(&r->thread, r) != 0) {
+            ctx->resolvers = r->next;
+            free(r);
+            s->refs -= 1;
+            wtb_session_fail(s, "cannot start the name resolver");
+        }
     }
     wtb_mutex_unlock(&ctx->lock);
+    wtb_join_resolvers(finished); /* already done; joins return at once */
     wtb_wake(ctx);
     return s;
 }
