@@ -165,6 +165,17 @@ static void test_detect_validation(void) {
     bad.pixels = NULL;
     NGH_CHECK_EQ_INT(ngh_face_detect(f, &bad, 1, &r), NGH_ERR_INVALID_ARG);
 
+    /* A stride shorter than a row would read past the caller's buffer. */
+    bad = img;
+    bad.stride = g_w * 3 - 1;
+    NGH_CHECK_EQ_INT(ngh_face_detect(f, &bad, 1, &r), NGH_ERR_INVALID_ARG);
+    bad.stride = -(g_w * 3);
+    NGH_CHECK_EQ_INT(ngh_face_detect(f, &bad, 1, &r), NGH_ERR_INVALID_ARG);
+
+    bad = img;
+    bad.format = (ngh_pixfmt)0;
+    NGH_CHECK_EQ_INT(ngh_face_detect(f, &bad, 1, &r), NGH_ERR_INVALID_ARG);
+
     {
         ngh_face_result small;
         memset(&small, 0, sizeof(small));
@@ -255,14 +266,18 @@ static void test_strided_input(void) {
     NGH_TEST_DONE();
 }
 
-/* Threading must not change what the model sees, only when we see it back. */
-static void test_threaded_matches_sync(void) {
+/* Threading must not change what the model sees, only when we see it back.
+ * With pad > 0 the worker gets a strided copy, which it packs on its own. */
+static void threaded_matches_sync(int pad) {
     ngh_face *sync_face, *thr_face;
     ngh_face_result sync_r, thr_r;
     ngh_image img;
     int i, n, tries;
+    int stride = g_w * 3 + pad;
+    unsigned char *strided = NULL;
 
-    NGH_TEST_CASE("threaded result matches synchronous");
+    NGH_TEST_CASE(pad ? "threaded strided result matches synchronous"
+                      : "threaded result matches synchronous");
     NGH_CHECK_EQ_INT(ngh_face_result_alloc(&sync_r, 1, 0, 0), NGH_OK);
     NGH_CHECK_EQ_INT(ngh_face_result_alloc(&thr_r, 1, 0, 0), NGH_OK);
     img = ngh_image_rgb(g_portrait, g_w, g_h, 0);
@@ -271,6 +286,20 @@ static void test_threaded_matches_sync(void) {
     n = ngh_face_detect(sync_face, &img, 1, &sync_r);
     ngh_face_destroy(sync_face);
     NGH_CHECK_EQ_INT(n, 1);
+
+    if (pad) {
+        strided = (unsigned char *)malloc((size_t)stride * (size_t)g_h);
+        if (!strided) {
+            ngh_test_fail(__FILE__, __LINE__, "oom");
+            thr_face = NULL;
+            goto done;
+        }
+        memset(strided, 0xAB, (size_t)stride * (size_t)g_h);
+        for (i = 0; i < g_h; ++i)
+            memcpy(strided + (size_t)stride * (size_t)i,
+                   g_portrait + (size_t)g_w * 3 * (size_t)i, (size_t)g_w * 3);
+        img = ngh_image_rgb(strided, g_w, g_h, stride);
+    }
 
     thr_face = make_face(1);
     if (!thr_face || ngh_face_state(thr_face) != NGH_READY) {
@@ -304,7 +333,13 @@ done:
     ngh_face_destroy(thr_face);
     ngh_face_result_free(&sync_r);
     ngh_face_result_free(&thr_r);
+    free(strided);
     NGH_TEST_DONE();
+}
+
+static void test_threaded_matches_sync(void) {
+    threaded_matches_sync(0);
+    threaded_matches_sync(37);
 }
 
 /* accel is a hint: a GPU request on a host that cannot honour it (Windows,
