@@ -47,6 +47,16 @@ static void wtb_mutex_destroy(wtb_mutex_t* m) { DeleteCriticalSection(m); }
 static void wtb_mutex_lock(wtb_mutex_t* m) { EnterCriticalSection(m); }
 static void wtb_mutex_unlock(wtb_mutex_t* m) { LeaveCriticalSection(m); }
 static void wtb_sleep_ms(unsigned ms) { Sleep(ms); }
+static DWORD WINAPI wtb_resolver_main(LPVOID arg);
+static int wtb_spawn_resolver(void* arg)
+{
+    HANDLE h = CreateThread(NULL, 0, wtb_resolver_main, arg, 0, NULL);
+    if (h == NULL) {
+        return -1;
+    }
+    CloseHandle(h); /* detached: it reports back through the op queue */
+    return 0;
+}
 typedef SOCKET wtb_socket_t;
 #define WTB_BAD_SOCKET INVALID_SOCKET
 #define wtb_closesocket closesocket
@@ -71,6 +81,16 @@ static void wtb_sleep_ms(unsigned ms)
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+static void* wtb_resolver_main(void* arg);
+static int wtb_spawn_resolver(void* arg)
+{
+    pthread_t t;
+    if (pthread_create(&t, NULL, wtb_resolver_main, arg) != 0) {
+        return -1;
+    }
+    pthread_detach(t); /* it reports back through the op queue */
+    return 0;
 }
 typedef int wtb_socket_t;
 #define WTB_BAD_SOCKET (-1)
@@ -223,7 +243,9 @@ struct ngh_wtb_session {
     size_t pin_count;
     uint32_t idle_timeout_ms;
     uint32_t connect_timeout_ms;
-    uint64_t connect_deadline;
+    uint64_t connect_deadline; /* set at connect(), so it covers DNS too */
+    struct sockaddr_storage addr; /* written by the resolver thread */
+    int resolve_failed;
     /* network-thread objects */
     picoquic_cnx_t* cnx;
     h3zero_callback_ctx_t* h3;
@@ -253,6 +275,8 @@ struct ngh_wtb_ctx {
     wtb_op* op_tail;
     ngh_wtb_session* sessions;
     int loop_ready; /* the packet loop opened its sockets; under lock */
+    int resolving;  /* resolver threads still running; under lock */
+    int closing;    /* ctx_destroy started: resolvers must not queue ops */
     ptls_verify_certificate_t verifier;
     char err[256];
 };
@@ -662,13 +686,51 @@ static int wtb_session_cb(picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
 
 /* ------------------------------------------------- network thread work -- */
 
-static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
+/* Resolver thread: getaddrinfo can block for seconds, so it must not run
+ * on the network thread, which holds ctx->lock while it works -- every
+ * app-side call would stall behind it. The resolver holds a session
+ * reference and touches shared state only under the lock. */
+#if defined(_WIN32)
+static DWORD WINAPI wtb_resolver_main(LPVOID arg)
+#else
+static void* wtb_resolver_main(void* arg)
+#endif
 {
+    ngh_wtb_session* s = (ngh_wtb_session*)arg;
+    ngh_wtb_ctx* ctx = s->ctx;
     struct sockaddr_storage addr;
     int is_name = 0;
+    /* host and port are immutable after connect(); no lock needed */
+    int failed = picoquic_get_server_address(s->host, s->port, &addr,
+        &is_name) != 0;
+
+    wtb_mutex_lock(&ctx->lock);
+    s->addr = addr;
+    s->resolve_failed = failed;
+    if (!ctx->closing && !s->dead && s->state == NGH_WTB_PENDING) {
+        wtb_op_push(ctx, WTB_OP_CONNECT, s, NULL, 0, NULL);
+    }
+    wtb_wake(ctx);
+    /* Last touch of ctx: once `resolving` drops and the lock is released,
+     * ctx_destroy may free it. */
+    ctx->resolving -= 1;
+    wtb_session_unref(s);
+    wtb_mutex_unlock(&ctx->lock);
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
+{
     uint64_t now = picoquic_current_time();
 
-    if (picoquic_get_server_address(s->host, s->port, &addr, &is_name) != 0) {
+    if (s->dead || s->state != NGH_WTB_PENDING) {
+        return; /* timed out or destroyed while resolving */
+    }
+    if (s->resolve_failed) {
         wtb_session_fail(s, "cannot resolve host");
         return;
     }
@@ -676,7 +738,7 @@ static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
      * this thread, so the quic-wide default cannot leak across sessions. */
     picoquic_set_default_idle_timeout(ctx->quic,
         (s->idle_timeout_ms != 0) ? s->idle_timeout_ms : 30000);
-    if (picowt_prepare_client_cnx(ctx->quic, (struct sockaddr*)&addr,
+    if (picowt_prepare_client_cnx(ctx->quic, (struct sockaddr*)&s->addr,
             &s->cnx, &s->h3, &s->control, now, s->host) != 0) {
         wtb_session_fail(s, "connection setup failed");
         return;
@@ -691,7 +753,6 @@ static void wtb_do_connect(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
         wtb_session_fail(s, "cannot start connection");
         return;
     }
-    s->connect_deadline = now + (uint64_t)s->connect_timeout_ms * 1000;
 }
 
 static void wtb_do_session_teardown(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
@@ -806,6 +867,13 @@ static void wtb_pump(ngh_wtb_ctx* ctx)
     wtb_process_ops(ctx);
     for (s = ctx->sessions; s != NULL; s = s->next) {
         ngh_wtb_stream* st;
+        if (s->state == NGH_WTB_PENDING && now > s->connect_deadline) {
+            wtb_session_fail(s, "connect timeout");
+            if (s->cnx != NULL) {
+                (void)picoquic_close(s->cnx, 0);
+            }
+            continue;
+        }
         if (s->cnx == NULL) {
             continue;
         }
@@ -816,12 +884,6 @@ static void wtb_pump(ngh_wtb_ctx* ctx)
             else if (s->state == NGH_WTB_READY) {
                 s->state = NGH_WTB_CLOSED;
             }
-            continue;
-        }
-        if (s->state == NGH_WTB_PENDING && s->connect_deadline != 0 &&
-            now > s->connect_deadline) {
-            wtb_session_fail(s, "connect timeout");
-            (void)picoquic_close(s->cnx, 0);
             continue;
         }
         if (s->dgram_sendq.head != NULL && s->state == NGH_WTB_READY) {
@@ -983,7 +1045,15 @@ void ngh_wtb_ctx_destroy(ngh_wtb_ctx* ctx)
     if (ctx == NULL) {
         return;
     }
+    /* Resolver threads hold ctx->lock and session references; getaddrinfo
+     * cannot be cancelled, so wait them out before tearing anything down. */
     wtb_mutex_lock(&ctx->lock);
+    ctx->closing = 1;
+    while (ctx->resolving > 0) {
+        wtb_mutex_unlock(&ctx->lock);
+        wtb_sleep_ms(1);
+        wtb_mutex_lock(&ctx->lock);
+    }
     for (s = ctx->sessions; s != NULL; s = s->next) {
         if (s->cnx != NULL &&
             picoquic_get_cnx_state(s->cnx) != picoquic_state_disconnected) {
@@ -1117,10 +1187,19 @@ ngh_wtb_session* ngh_wtb_connect(ngh_wtb_ctx* ctx, const char* url,
     memcpy(s->pins, opt->cert_hashes, 32 * opt->cert_hash_count);
     s->pin_count = opt->cert_hash_count;
 
+    s->connect_deadline = picoquic_current_time() +
+        (uint64_t)s->connect_timeout_ms * 1000;
+
     wtb_mutex_lock(&ctx->lock);
     s->next = ctx->sessions;
     ctx->sessions = s;
-    wtb_op_push(ctx, WTB_OP_CONNECT, s, NULL, 0, NULL);
+    s->refs += 1; /* the resolver's */
+    ctx->resolving += 1;
+    if (wtb_spawn_resolver(s) != 0) {
+        s->refs -= 1;
+        ctx->resolving -= 1;
+        wtb_session_fail(s, "cannot start the name resolver");
+    }
     wtb_mutex_unlock(&ctx->lock);
     wtb_wake(ctx);
     return s;

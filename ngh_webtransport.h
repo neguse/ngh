@@ -145,7 +145,8 @@ typedef struct ngh_wt_options {
     size_t cert_hash_count;
     uint32_t idle_timeout_ms;    /* 0 = default (30s). Desktop only; the
                                   * browser owns its own QUIC timeouts. */
-    uint32_t connect_timeout_ms; /* 0 = default (10s) */
+    uint32_t connect_timeout_ms; /* 0 = default (10s); counted from
+                                  * connect(), DNS lookup included */
 } ngh_wt_options;
 
 ngh_wt_options ngh_wt_options_default(void);
