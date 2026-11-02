@@ -163,6 +163,13 @@ ngh_wt_options ngh_wt_options_default(void);
  * success; on failure ngh_wt_last_error() explains. */
 int ngh_wt_runtime_load(const char *path);
 
+/* Desktop only; a no-op on the web. Stops the backend's network thread,
+ * closes whatever sessions remain and unloads the library; the next
+ * connect or ngh_wt_runtime_load starts over. Every ngh_wt and
+ * ngh_wt_stream handle must be destroyed first -- they point into the
+ * backend. Blocks while a DNS lookup started by a connect finishes. */
+void ngh_wt_runtime_unload(void);
+
 /* Explains the most recent NULL return from ngh_wt_connect or nonzero
  * return from ngh_wt_runtime_load. */
 const char *ngh_wt_last_error(void);
@@ -445,6 +452,16 @@ int ngh_wt_runtime_load(const char *path) {
                  " (set NGH_WT_BACKEND_PATH or place it next to the "
                  "executable)");
     return NGH_WT_ERR;
+}
+
+void ngh_wt_runtime_unload(void) {
+    if (!ngh_wt__rt.loaded) return;
+    if (ngh_wt__ctx != NULL) {
+        ngh_wt__rt.ctx_destroy(ngh_wt__ctx);
+        ngh_wt__ctx = NULL;
+    }
+    ngh_wt__dlclose(ngh_wt__rt.handle);
+    memset(&ngh_wt__rt, 0, sizeof(ngh_wt__rt));
 }
 
 static int ngh_wt__ensure(void) {
@@ -1018,6 +1035,8 @@ int ngh_wt_runtime_load(const char *path) {
     (void)path;
     return 0;
 }
+
+void ngh_wt_runtime_unload(void) {}
 
 ngh_wt *ngh_wt_connect(const char *url, const ngh_wt_options *opt) {
     ngh_wt *wt;

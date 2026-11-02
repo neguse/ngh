@@ -79,6 +79,23 @@ static void test_timeout_covers_dns(long delay) {
     NGH_TEST_DONE();
 }
 
+static void test_unload_waits_for_lookup(long delay) {
+    ngh_wt *wt;
+    double start, took;
+
+    NGH_TEST_CASE("unload during a lookup waits it out");
+    wt = connect_localhost(10000);
+    NGH_CHECK(wt != NULL);
+    ngh_wt_destroy(wt);
+    start = now_ms();
+    ngh_wt_runtime_unload();
+    took = now_ms() - start;
+    printf("    unload took %.0f ms (lookup %ld)\n", took, delay);
+    NGH_CHECK(took < (double)delay * 2);
+    NGH_CHECK(ngh_wt_runtime_load(NULL) == 0);
+    NGH_TEST_DONE();
+}
+
 int main(void) {
     const char *env = getenv("NGH_TEST_DNS_DELAY_MS");
     long delay = env ? atol(env) : 0;
@@ -100,5 +117,6 @@ int main(void) {
     }
     test_polls_do_not_wait_for_dns(delay);
     test_timeout_covers_dns(delay);
+    test_unload_waits_for_lookup(delay);
     return ngh_test_report("test_wt_dns");
 }

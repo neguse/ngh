@@ -12,6 +12,9 @@
 static void sleep_ms(unsigned ms) { Sleep(ms); }
 #else
 #include <time.h>
+#if defined(__linux__)
+#include <dirent.h>
+#endif
 static void sleep_ms(unsigned ms) {
     struct timespec ts;
     ts.tv_sec = ms / 1000;
@@ -103,6 +106,47 @@ static void test_url_parsing(void) {
     }
 }
 
+static int thread_count(void) {
+#if defined(__linux__)
+    /* one /proc/self/task entry per thread, plus "." and ".." */
+    int n = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    while (readdir(d)) n++;
+    closedir(d);
+    return n - 2;
+#else
+    return -1;
+#endif
+}
+
+static void test_unload(void) {
+    ngh_wt_options opt = ngh_wt_options_default();
+    ngh_wt *wt;
+    int with_backend, after;
+    opt.cert_hashes = dummy_hash;
+    opt.cert_hash_count = 1;
+    opt.connect_timeout_ms = 200;
+
+    /* the backend context (and its network thread) exists after a connect */
+    wt = ngh_wt_connect("https://127.0.0.1:9/", &opt);
+    NGH_CHECK(wt != NULL);
+    ngh_wt_destroy(wt);
+    with_backend = thread_count();
+
+    ngh_wt_runtime_unload();
+    ngh_wt_runtime_unload(); /* twice is harmless */
+    after = thread_count();
+    if (with_backend >= 0) {
+        printf("    threads: %d with the backend, %d after unload\n",
+               with_backend, after);
+        NGH_CHECK(after < with_backend);
+    }
+
+    /* and everything starts over on the next use */
+    NGH_CHECK(ngh_wt_runtime_load(NULL) == 0);
+}
+
 int main(void) {
     test_args();
 
@@ -113,6 +157,8 @@ int main(void) {
     test_missing_cert_hash();
     test_url_parsing();
     test_connect_failure();
+    test_unload();
+    test_connect_failure(); /* works again after a reload */
 
     return ngh_test_report("test_wt");
 }
