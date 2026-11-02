@@ -1228,25 +1228,31 @@ static int ngh__make_image(const uint8_t *px, size_t size, int w, int h,
     return NGH_OK;
 }
 
-/* ------------------------------------------------------------------ face -- */
+/* ------------------------------------------------------------------ task --
+ *
+ * Face and pose are the same machine with different result shapes: one
+ * MediaPipe landmarker in VIDEO mode, up to three float outputs per detected
+ * item, and an optional worker thread with newest-frame semantics. ngh__task
+ * is that machine; only option setup and result decoding differ per kind. */
 
-struct ngh_face {
+enum { NGH__KIND_FACE = 0, NGH__KIND_POSE = 1 };
+#define NGH__OUTS 3
+
+typedef struct ngh__task {
     void *lm;
+    int kind;
     ngh_state state;
     ngh_accel accel;
     char error[512];
 
-    int max_faces;
-    int want_blendshapes;
-    int want_transform;
+    int max_n;
+    size_t per[NGH__OUTS]; /* floats per detected item; 0 = output disabled */
 
     uint8_t *pack; /* row-packing scratch for strided input */
     size_t pack_cap;
 
-    /* Filled by inference; copied out by ngh_face_detect(). */
-    float *lm_buf;
-    float *bs_buf;
-    float *tf_buf;
+    /* Filled by inference; copied out by detect. */
+    float *buf[NGH__OUTS];
     int count;
     uint64_t result_ts;
     int infer_err;
@@ -1257,128 +1263,208 @@ struct ngh_face {
 #ifndef NGH_NO_THREADS
     int threaded;
     ngh__worker wk;
-    float *pub_lm;
-    float *pub_bs;
-    float *pub_tf;
+    float *pub[NGH__OUTS];
     int pub_count;
     uint64_t pub_ts;
     int pub_valid;
     int pub_err;
 #endif
+} ngh__task;
+
+struct ngh_face {
+    ngh__task t;
 };
 
-static void ngh__face_read_result(ngh_face *f, const ngh__mp_face_result *res) {
+struct ngh_pose {
+    ngh__task t;
+};
+
+static size_t ngh__task_floats(const ngh__task *t, int i) {
+    return (size_t)t->max_n * t->per[i];
+}
+
+/* Allocates `bufs[i]` for every enabled output. Returns 0 on OOM. */
+static int ngh__task_alloc(ngh__task *t, float **bufs) {
+    int i;
+    for (i = 0; i < NGH__OUTS; ++i) {
+        if (!t->per[i]) continue;
+        bufs[i] = (float *)calloc(ngh__task_floats(t, i), sizeof(float));
+        if (!bufs[i]) return 0;
+    }
+    return 1;
+}
+
+/* Allocates a task with its inference buffers, or NULL on OOM. */
+static ngh__task *ngh__task_new(size_t size, int kind, int max_n,
+                                const size_t per[NGH__OUTS], ngh_accel accel) {
+    ngh__task *t = (ngh__task *)calloc(1, size);
+    if (!t) return NULL;
+    t->kind = kind;
+    t->max_n = max_n;
+    memcpy(t->per, per, sizeof(t->per));
+    t->accel = (accel == NGH_ACCEL_GPU) ? NGH_ACCEL_GPU : NGH_ACCEL_CPU;
+    if (!ngh__task_alloc(t, t->buf)) {
+        int i;
+        for (i = 0; i < NGH__OUTS; ++i) free(t->buf[i]);
+        free(t);
+        return NULL;
+    }
+    return t;
+}
+
+/* Copies `n` landmarks into dst with `stride` floats each: x, y, z, then
+ * visibility when stride is 4 (1.0 when MediaPipe did not report one). */
+static void ngh__copy_landmarks(float *dst, const ngh__mp_landmarks *src,
+                                uint32_t max, int stride) {
+    uint32_t cnt = src->landmarks_count;
+    uint32_t j;
+    if (cnt > max) cnt = max;
+    for (j = 0; j < cnt; ++j) {
+        const ngh__mp_landmark *l = &src->landmarks[j];
+        dst[j * stride + 0] = l->x;
+        dst[j * stride + 1] = l->y;
+        dst[j * stride + 2] = l->z;
+        if (stride == 4) dst[j * 4 + 3] = l->has_visibility ? l->visibility : 1.0f;
+    }
+}
+
+static void ngh__face_read_result(ngh__task *t, const ngh__mp_face_result *res) {
     uint32_t n = res->face_landmarks_count;
     uint32_t i, j;
-    if ((int)n > f->max_faces) n = (uint32_t)f->max_faces;
+    if ((int)n > t->max_n) n = (uint32_t)t->max_n;
     for (i = 0; i < n; ++i) {
-        const ngh__mp_landmarks *src = &res->face_landmarks[i];
-        uint32_t cnt = src->landmarks_count;
-        float *dst = f->lm_buf + (size_t)i * NGH_FACE_LANDMARKS * 3;
-        if (cnt > NGH_FACE_LANDMARKS) cnt = NGH_FACE_LANDMARKS;
-        for (j = 0; j < cnt; ++j) {
-            dst[j * 3 + 0] = src->landmarks[j].x;
-            dst[j * 3 + 1] = src->landmarks[j].y;
-            dst[j * 3 + 2] = src->landmarks[j].z;
-        }
+        ngh__copy_landmarks(t->buf[0] + (size_t)i * t->per[0],
+                            &res->face_landmarks[i], NGH_FACE_LANDMARKS, 3);
     }
-    if (f->bs_buf && res->face_blendshapes) {
+    if (t->buf[1] && res->face_blendshapes) {
         uint32_t bn = res->face_blendshapes_count;
         if (bn > n) bn = n;
         for (i = 0; i < bn; ++i) {
             const ngh__mp_categories *src = &res->face_blendshapes[i];
             uint32_t cnt = src->categories_count;
-            float *dst = f->bs_buf + (size_t)i * NGH_FACE_BLENDSHAPES;
+            float *dst = t->buf[1] + (size_t)i * NGH_FACE_BLENDSHAPES;
             if (cnt > NGH_FACE_BLENDSHAPES) cnt = NGH_FACE_BLENDSHAPES;
             for (j = 0; j < cnt; ++j) dst[j] = src->categories[j].score;
         }
     }
-    if (f->tf_buf && res->facial_transformation_matrixes) {
+    if (t->buf[2] && res->facial_transformation_matrixes) {
         uint32_t mn = res->facial_transformation_matrixes_count;
         if (mn > n) mn = n;
         for (i = 0; i < mn; ++i) {
             const ngh__mp_matrix *src = &res->facial_transformation_matrixes[i];
             uint32_t cnt = src->rows * src->cols;
-            float *dst = f->tf_buf + (size_t)i * NGH_FACE_MATRIX;
+            float *dst = t->buf[2] + (size_t)i * NGH_FACE_MATRIX;
             if (cnt > NGH_FACE_MATRIX) cnt = NGH_FACE_MATRIX;
             for (j = 0; j < cnt; ++j) dst[j] = src->data[j];
         }
     }
-    f->count = (int)n;
+    t->count = (int)n;
 }
 
-static void ngh__face_infer(ngh_face *f, const uint8_t *px, size_t size, int w,
-                            int h, int fmt, int rot, uint64_t ts) {
-    ngh__mp_face_result res;
+static void ngh__pose_read_result(ngh__task *t, const ngh__mp_pose_result *res) {
+    uint32_t n = res->pose_landmarks_count;
+    uint32_t i;
+    if ((int)n > t->max_n) n = (uint32_t)t->max_n;
+    for (i = 0; i < n; ++i) {
+        ngh__copy_landmarks(t->buf[0] + (size_t)i * t->per[0],
+                            &res->pose_landmarks[i], NGH_POSE_LANDMARKS, 4);
+    }
+    if (t->buf[1] && res->pose_world_landmarks) {
+        uint32_t wn = res->pose_world_landmarks_count;
+        if (wn > n) wn = n;
+        for (i = 0; i < wn; ++i) {
+            ngh__copy_landmarks(t->buf[1] + (size_t)i * t->per[1],
+                                &res->pose_world_landmarks[i],
+                                NGH_POSE_LANDMARKS, 4);
+        }
+    }
+    t->count = (int)n;
+}
+
+static void ngh__task_infer(ngh__task *t, const uint8_t *px, size_t size,
+                            int w, int h, int fmt, int rot, uint64_t ts) {
     ngh__mp_ipo ipo;
     void *img = NULL;
     char *mp_err = NULL;
     int st;
 
-    f->infer_err = NGH_OK;
-    f->count = 0;
-    f->result_ts = ts;
+    t->infer_err = NGH_OK;
+    t->count = 0;
+    t->result_ts = ts;
 
-    if (ngh__make_image(px, size, w, h, fmt, &img, f->error, sizeof(f->error)) !=
+    if (ngh__make_image(px, size, w, h, fmt, &img, t->error, sizeof(t->error)) !=
         NGH_OK) {
-        f->infer_err = NGH_ERR_BACKEND;
+        t->infer_err = NGH_ERR_BACKEND;
         return;
     }
 
     memset(&ipo, 0, sizeof(ipo));
     ipo.rotation_degrees = rot;
-    memset(&res, 0, sizeof(res));
 
-    st = ngh__rt.face_video(f->lm, img, &ipo, (int64_t)ts, &res, &mp_err);
-    if (st != NGH__MP_STATUS_OK) {
-        ngh__set_err(f->error, sizeof(f->error), "face detect failed", mp_err);
-        f->infer_err = NGH_ERR_BACKEND;
+    if (t->kind == NGH__KIND_FACE) {
+        ngh__mp_face_result res;
+        memset(&res, 0, sizeof(res));
+        st = ngh__rt.face_video(t->lm, img, &ipo, (int64_t)ts, &res, &mp_err);
+        if (st == NGH__MP_STATUS_OK) {
+            ngh__face_read_result(t, &res);
+            ngh__rt.face_close_result(&res);
+        }
     } else {
-        ngh__face_read_result(f, &res);
-        ngh__rt.face_close_result(&res);
+        ngh__mp_pose_result res;
+        memset(&res, 0, sizeof(res));
+        st = ngh__rt.pose_video(t->lm, img, &ipo, (int64_t)ts, &res, &mp_err);
+        if (st == NGH__MP_STATUS_OK) {
+            ngh__pose_read_result(t, &res);
+            ngh__rt.pose_close_result(&res);
+        }
+    }
+    if (st != NGH__MP_STATUS_OK) {
+        ngh__set_err(t->error, sizeof(t->error),
+                     t->kind == NGH__KIND_FACE ? "face detect failed"
+                                               : "pose detect failed",
+                     mp_err);
+        t->infer_err = NGH_ERR_BACKEND;
     }
     ngh__rt.image_free(img);
 }
 
 #ifndef NGH_NO_THREADS
-static void ngh__face_publish(ngh_face *f) {
-    size_t lm_n = (size_t)f->max_faces * NGH_FACE_LANDMARKS * 3;
-    memcpy(f->pub_lm, f->lm_buf, lm_n * sizeof(float));
-    if (f->pub_bs)
-        memcpy(f->pub_bs, f->bs_buf,
-               (size_t)f->max_faces * NGH_FACE_BLENDSHAPES * sizeof(float));
-    if (f->pub_tf)
-        memcpy(f->pub_tf, f->tf_buf,
-               (size_t)f->max_faces * NGH_FACE_MATRIX * sizeof(float));
-    f->pub_count = f->count;
-    f->pub_ts = f->result_ts;
-    f->pub_err = f->infer_err;
-    f->pub_valid = 1;
+/* Caller must hold t->wk.mu. */
+static void ngh__task_publish(ngh__task *t) {
+    int i;
+    for (i = 0; i < NGH__OUTS; ++i) {
+        if (t->pub[i])
+            memcpy(t->pub[i], t->buf[i], ngh__task_floats(t, i) * sizeof(float));
+    }
+    t->pub_count = t->count;
+    t->pub_ts = t->result_ts;
+    t->pub_err = t->infer_err;
+    t->pub_valid = 1;
 }
 
 #if defined(_WIN32)
-static DWORD WINAPI ngh__face_thread(LPVOID arg)
+static DWORD WINAPI ngh__task_thread(LPVOID arg)
 #else
-static void *ngh__face_thread(void *arg)
+static void *ngh__task_thread(void *arg)
 #endif
 {
-    ngh_face *f = (ngh_face *)arg;
+    ngh__task *t = (ngh__task *)arg;
     for (;;) {
         size_t size;
         int w, h, fmt, rot;
         uint64_t ts;
-        ngh__lock(&f->wk.mu);
-        if (!ngh__worker_take(&f->wk, &size, &w, &h, &fmt, &rot, &ts)) {
-            ngh__unlock(&f->wk.mu);
+        ngh__lock(&t->wk.mu);
+        if (!ngh__worker_take(&t->wk, &size, &w, &h, &fmt, &rot, &ts)) {
+            ngh__unlock(&t->wk.mu);
             break;
         }
-        ngh__unlock(&f->wk.mu);
+        ngh__unlock(&t->wk.mu);
 
-        ngh__face_infer(f, f->wk.scratch, size, w, h, fmt, rot, ts);
+        ngh__task_infer(t, t->wk.scratch, size, w, h, fmt, rot, ts);
 
-        ngh__lock(&f->wk.mu);
-        ngh__face_publish(f);
-        ngh__unlock(&f->wk.mu);
+        ngh__lock(&t->wk.mu);
+        ngh__task_publish(t);
+        ngh__unlock(&t->wk.mu);
     }
 #if defined(_WIN32)
     return 0;
@@ -1386,39 +1472,149 @@ static void *ngh__face_thread(void *arg)
     return NULL;
 #endif
 }
+
+/* Returns 0 on OOM. A thread that fails to start leaves the task
+ * synchronous rather than failing it. */
+static int ngh__task_start_worker(ngh__task *t) {
+    if (!ngh__task_alloc(t, t->pub)) return 0;
+    ngh__mutex_init(&t->wk.mu);
+    ngh__cond_init(&t->wk.cv);
+#if defined(_WIN32)
+    t->wk.thread = CreateThread(NULL, 0, ngh__task_thread, t, 0, NULL);
+    t->wk.started = t->wk.thread != NULL;
+#else
+    t->wk.started = pthread_create(&t->wk.thread, NULL, ngh__task_thread, t) == 0;
+#endif
+    if (!t->wk.started) {
+        ngh__cond_destroy(&t->wk.cv);
+        ngh__mutex_destroy(&t->wk.mu);
+    }
+    t->threaded = t->wk.started;
+    return 1;
+}
 #endif /* NGH_NO_THREADS */
+
+static void ngh__task_destroy(ngh__task *t) {
+    int i;
+    if (!t) return;
+#ifndef NGH_NO_THREADS
+    if (t->threaded) ngh__worker_destroy(&t->wk);
+    for (i = 0; i < NGH__OUTS; ++i) free(t->pub[i]);
+#endif
+    if (t->lm) {
+        char *mp_err = NULL;
+        if (t->kind == NGH__KIND_FACE && ngh__rt.face_close)
+            ngh__rt.face_close(t->lm, &mp_err);
+        else if (t->kind == NGH__KIND_POSE && ngh__rt.pose_close)
+            ngh__rt.pose_close(t->lm, &mp_err);
+        if (mp_err && ngh__rt.error_free) ngh__rt.error_free(mp_err);
+    }
+    for (i = 0; i < NGH__OUTS; ++i) free(t->buf[i]);
+    free(t->pack);
+    free(t);
+}
+
+/* Finishes creation after the kind-specific create call. Returns the task,
+ * or NULL (task freed) when the worker could not be allocated. */
+static ngh__task *ngh__task_created(ngh__task *t, int st, char *mp_err,
+                                    int threaded) {
+    if (st != NGH__MP_STATUS_OK || !t->lm) {
+        t->state = NGH_FAILED;
+        ngh__set_err(t->error, sizeof(t->error),
+                     t->kind == NGH__KIND_FACE ? "MpFaceLandmarkerCreate failed"
+                                               : "MpPoseLandmarkerCreate failed",
+                     mp_err);
+        return t; /* keep the handle so the caller can read the message */
+    }
+    t->state = NGH_READY;
+#ifndef NGH_NO_THREADS
+    if (threaded && !ngh__task_start_worker(t)) {
+        ngh__task_destroy(t);
+        return NULL;
+    }
+#else
+    (void)threaded;
+#endif
+    return t;
+}
+
+/* `outs` are the caller's buffers for each output (NULL = not wanted). */
+static int ngh__task_detect(ngh__task *t, const ngh_image *image,
+                            uint64_t ts_ms, float *const outs[NGH__OUTS],
+                            int capacity, int *out_count,
+                            uint64_t *out_ts) {
+    const uint8_t *px;
+    size_t size;
+    int fmt, rc, n, i;
+
+    if (t->state != NGH_READY) return NGH_ERR_NOT_READY;
+    if (!ngh__image_valid(image) || image->kind != NGH_IMAGE_PIXELS)
+        return NGH_ERR_INVALID_ARG;
+    if (capacity < t->max_n) return NGH_ERR_CAPACITY;
+    if (t->have_ts && ts_ms <= t->last_ts) return NGH_ERR_TIMESTAMP;
+    t->last_ts = ts_ms;
+    t->have_ts = 1;
+
+    rc = ngh__pack_rows(image, &t->pack, &t->pack_cap, &px, &size);
+    if (rc != NGH_OK) return rc;
+    fmt = (image->format == NGH_PIXFMT_RGBA8) ? NGH__MP_FMT_SRGBA
+                                              : NGH__MP_FMT_SRGB;
+
+#ifndef NGH_NO_THREADS
+    if (t->threaded) {
+        int have, err;
+        ngh__lock(&t->wk.mu);
+        rc = ngh__worker_submit(&t->wk, px, size, image->width, image->height,
+                                fmt, image->rotation_degrees, ts_ms);
+        have = t->pub_valid;
+        n = have ? t->pub_count : 0;
+        for (i = 0; i < NGH__OUTS; ++i) {
+            if (outs[i] && t->pub[i])
+                memcpy(outs[i], t->pub[i], (size_t)n * t->per[i] * sizeof(float));
+        }
+        *out_count = n;
+        *out_ts = have ? t->pub_ts : 0;
+        err = have ? t->pub_err : NGH_OK;
+        ngh__unlock(&t->wk.mu);
+        if (rc != NGH_OK) return rc;
+        if (err != NGH_OK) return err;
+        return n;
+    }
+#endif
+
+    ngh__task_infer(t, px, size, image->width, image->height, fmt,
+                    image->rotation_degrees, ts_ms);
+    if (t->infer_err != NGH_OK) return t->infer_err;
+    n = t->count;
+    for (i = 0; i < NGH__OUTS; ++i) {
+        if (outs[i] && t->buf[i])
+            memcpy(outs[i], t->buf[i], (size_t)n * t->per[i] * sizeof(float));
+    }
+    *out_count = n;
+    *out_ts = ts_ms;
+    return n;
+}
+
+/* ------------------------------------------------------------------ face -- */
 
 ngh_face *ngh_face_create(const void *model, size_t model_size,
                           const ngh_face_options *options) {
     ngh_face_options opt = options ? *options : ngh_face_options_default();
     ngh__mp_face_options mp;
-    ngh_face *f;
+    ngh__task *t;
+    size_t per[NGH__OUTS];
     char *mp_err = NULL;
     int st;
 
     if (!model || model_size == 0 || opt.max_faces <= 0) return NULL;
     if (ngh_runtime_load(NULL) != NGH_OK) return NULL;
 
-    f = (ngh_face *)calloc(1, sizeof(ngh_face));
-    if (!f) return NULL;
-    f->max_faces = opt.max_faces;
-    f->want_blendshapes = opt.blendshapes ? 1 : 0;
-    f->want_transform = opt.transform ? 1 : 0;
-    f->accel = (opt.accel == NGH_ACCEL_GPU) ? NGH_ACCEL_GPU : NGH_ACCEL_CPU;
-
-    f->lm_buf = (float *)calloc((size_t)opt.max_faces * NGH_FACE_LANDMARKS * 3,
-                                sizeof(float));
-    if (f->want_blendshapes)
-        f->bs_buf = (float *)calloc(
-            (size_t)opt.max_faces * NGH_FACE_BLENDSHAPES, sizeof(float));
-    if (f->want_transform)
-        f->tf_buf = (float *)calloc((size_t)opt.max_faces * NGH_FACE_MATRIX,
-                                    sizeof(float));
-    if (!f->lm_buf || (f->want_blendshapes && !f->bs_buf) ||
-        (f->want_transform && !f->tf_buf)) {
-        ngh_face_destroy(f);
-        return NULL;
-    }
+    per[0] = NGH_FACE_LANDMARKS * 3;
+    per[1] = opt.blendshapes ? NGH_FACE_BLENDSHAPES : 0;
+    per[2] = opt.transform ? NGH_FACE_MATRIX : 0;
+    t = ngh__task_new(sizeof(ngh_face), NGH__KIND_FACE, opt.max_faces, per,
+                      opt.accel);
+    if (!t) return NULL;
 
     memset(&mp, 0, sizeof(mp));
     mp.base_options.model_asset_buffer = (const char *)model;
@@ -1429,321 +1625,61 @@ ngh_face *ngh_face_create(const void *model, size_t model_size,
     mp.min_face_detection_confidence = opt.min_detection_confidence;
     mp.min_face_presence_confidence = opt.min_presence_confidence;
     mp.min_tracking_confidence = opt.min_tracking_confidence;
-    mp.output_face_blendshapes = (unsigned char)f->want_blendshapes;
-    mp.output_facial_transformation_matrixes = (unsigned char)f->want_transform;
+    mp.output_face_blendshapes = (unsigned char)(per[1] != 0);
+    mp.output_facial_transformation_matrixes = (unsigned char)(per[2] != 0);
 
-    st = ngh__rt.face_create(&mp, &f->lm, &mp_err);
-    if (st != NGH__MP_STATUS_OK || !f->lm) {
-        f->state = NGH_FAILED;
-        ngh__set_err(f->error, sizeof(f->error), "MpFaceLandmarkerCreate failed",
-                     mp_err);
-        return f; /* keep the handle so the caller can read the message */
-    }
-    f->state = NGH_READY;
-
-#ifndef NGH_NO_THREADS
-    if (opt.threaded) {
-        f->pub_lm = (float *)calloc(
-            (size_t)opt.max_faces * NGH_FACE_LANDMARKS * 3, sizeof(float));
-        if (f->want_blendshapes)
-            f->pub_bs = (float *)calloc(
-                (size_t)opt.max_faces * NGH_FACE_BLENDSHAPES, sizeof(float));
-        if (f->want_transform)
-            f->pub_tf = (float *)calloc(
-                (size_t)opt.max_faces * NGH_FACE_MATRIX, sizeof(float));
-        if (!f->pub_lm || (f->want_blendshapes && !f->pub_bs) ||
-            (f->want_transform && !f->pub_tf)) {
-            ngh_face_destroy(f);
-            return NULL;
-        }
-        ngh__mutex_init(&f->wk.mu);
-        ngh__cond_init(&f->wk.cv);
-#if defined(_WIN32)
-        f->wk.thread = CreateThread(NULL, 0, ngh__face_thread, f, 0, NULL);
-        f->wk.started = f->wk.thread != NULL;
-#else
-        f->wk.started =
-            pthread_create(&f->wk.thread, NULL, ngh__face_thread, f) == 0;
-#endif
-        if (!f->wk.started) {
-            ngh__cond_destroy(&f->wk.cv);
-            ngh__mutex_destroy(&f->wk.mu);
-        }
-        f->threaded = f->wk.started;
-    }
-#endif
-    return f;
+    st = ngh__rt.face_create(&mp, &t->lm, &mp_err);
+    return (ngh_face *)ngh__task_created(t, st, mp_err, opt.threaded);
 }
 
 ngh_state ngh_face_state(const ngh_face *f) {
-    return f ? f->state : NGH_FAILED;
+    return f ? f->t.state : NGH_FAILED;
 }
 
 const char *ngh_face_error(const ngh_face *f) {
     if (!f) return ngh_runtime_error();
-    return f->error[0] ? f->error : NULL;
+    return f->t.error[0] ? f->t.error : NULL;
 }
 
 ngh_accel ngh_face_accel(const ngh_face *f) {
-    return f ? f->accel : NGH_ACCEL_CPU;
+    return f ? f->t.accel : NGH_ACCEL_CPU;
 }
 
 int ngh_face_detect(ngh_face *f, const ngh_image *image, uint64_t ts_ms,
                     ngh_face_result *out) {
-    const uint8_t *px;
-    size_t size;
-    int fmt, rc;
-
+    float *outs[NGH__OUTS];
     if (!f || !out || !out->landmarks) return NGH_ERR_INVALID_ARG;
-    if (f->state != NGH_READY) return NGH_ERR_NOT_READY;
-    if (!ngh__image_valid(image) || image->kind != NGH_IMAGE_PIXELS)
-        return NGH_ERR_INVALID_ARG;
-    if (out->capacity < f->max_faces) return NGH_ERR_CAPACITY;
-    if (f->have_ts && ts_ms <= f->last_ts) return NGH_ERR_TIMESTAMP;
-    f->last_ts = ts_ms;
-    f->have_ts = 1;
-
-    rc = ngh__pack_rows(image, &f->pack, &f->pack_cap, &px, &size);
-    if (rc != NGH_OK) return rc;
-    fmt = (image->format == NGH_PIXFMT_RGBA8) ? NGH__MP_FMT_SRGBA
-                                              : NGH__MP_FMT_SRGB;
-
-#ifndef NGH_NO_THREADS
-    if (f->threaded) {
-        int have;
-        ngh__lock(&f->wk.mu);
-        rc = ngh__worker_submit(&f->wk, px, size, image->width, image->height,
-                                fmt, image->rotation_degrees, ts_ms);
-        have = f->pub_valid;
-        if (have) {
-            int n = f->pub_count;
-            memcpy(out->landmarks, f->pub_lm,
-                   (size_t)n * NGH_FACE_LANDMARKS * 3 * sizeof(float));
-            if (out->blendshapes && f->pub_bs)
-                memcpy(out->blendshapes, f->pub_bs,
-                       (size_t)n * NGH_FACE_BLENDSHAPES * sizeof(float));
-            if (out->transform && f->pub_tf)
-                memcpy(out->transform, f->pub_tf,
-                       (size_t)n * NGH_FACE_MATRIX * sizeof(float));
-            out->count = n;
-            out->timestamp_ms = f->pub_ts;
-        } else {
-            out->count = 0;
-            out->timestamp_ms = 0;
-        }
-        ngh__unlock(&f->wk.mu);
-        if (rc != NGH_OK) return rc;
-        if (have && f->pub_err != NGH_OK) return f->pub_err;
-        return out->count;
-    }
-#endif
-
-    ngh__face_infer(f, px, size, image->width, image->height, fmt,
-                    image->rotation_degrees, ts_ms);
-    if (f->infer_err != NGH_OK) return f->infer_err;
-    memcpy(out->landmarks, f->lm_buf,
-           (size_t)f->count * NGH_FACE_LANDMARKS * 3 * sizeof(float));
-    if (out->blendshapes && f->bs_buf)
-        memcpy(out->blendshapes, f->bs_buf,
-               (size_t)f->count * NGH_FACE_BLENDSHAPES * sizeof(float));
-    if (out->transform && f->tf_buf)
-        memcpy(out->transform, f->tf_buf,
-               (size_t)f->count * NGH_FACE_MATRIX * sizeof(float));
-    out->count = f->count;
-    out->timestamp_ms = ts_ms;
-    return f->count;
+    outs[0] = out->landmarks;
+    outs[1] = out->blendshapes;
+    outs[2] = out->transform;
+    return ngh__task_detect(&f->t, image, ts_ms, outs, out->capacity,
+                            &out->count, &out->timestamp_ms);
 }
 
 void ngh_face_destroy(ngh_face *f) {
-    if (!f) return;
-#ifndef NGH_NO_THREADS
-    if (f->threaded) ngh__worker_destroy(&f->wk);
-    free(f->pub_lm);
-    free(f->pub_bs);
-    free(f->pub_tf);
-#endif
-    if (f->lm && ngh__rt.face_close) {
-        char *mp_err = NULL;
-        ngh__rt.face_close(f->lm, &mp_err);
-        if (mp_err && ngh__rt.error_free) ngh__rt.error_free(mp_err);
-    }
-    free(f->lm_buf);
-    free(f->bs_buf);
-    free(f->tf_buf);
-    free(f->pack);
-    free(f);
+    if (f) ngh__task_destroy(&f->t);
 }
 
 /* ------------------------------------------------------------------ pose -- */
-
-struct ngh_pose {
-    void *lm;
-    ngh_state state;
-    ngh_accel accel;
-    char error[512];
-
-    int max_poses;
-    int want_world;
-
-    uint8_t *pack;
-    size_t pack_cap;
-
-    float *lm_buf;
-    float *world_buf;
-    int count;
-    uint64_t result_ts;
-    int infer_err;
-
-    uint64_t last_ts;
-    int have_ts;
-
-#ifndef NGH_NO_THREADS
-    int threaded;
-    ngh__worker wk;
-    float *pub_lm;
-    float *pub_world;
-    int pub_count;
-    uint64_t pub_ts;
-    int pub_valid;
-    int pub_err;
-#endif
-};
-
-static void ngh__pose_copy_landmarks(float *dst, const ngh__mp_landmarks *src) {
-    uint32_t cnt = src->landmarks_count;
-    uint32_t j;
-    if (cnt > NGH_POSE_LANDMARKS) cnt = NGH_POSE_LANDMARKS;
-    for (j = 0; j < cnt; ++j) {
-        dst[j * 4 + 0] = src->landmarks[j].x;
-        dst[j * 4 + 1] = src->landmarks[j].y;
-        dst[j * 4 + 2] = src->landmarks[j].z;
-        dst[j * 4 + 3] = src->landmarks[j].has_visibility
-                             ? src->landmarks[j].visibility
-                             : 1.0f;
-    }
-}
-
-static void ngh__pose_read_result(ngh_pose *p, const ngh__mp_pose_result *res) {
-    uint32_t n = res->pose_landmarks_count;
-    uint32_t i;
-    if ((int)n > p->max_poses) n = (uint32_t)p->max_poses;
-    for (i = 0; i < n; ++i) {
-        ngh__pose_copy_landmarks(p->lm_buf + (size_t)i * NGH_POSE_LANDMARKS * 4,
-                                 &res->pose_landmarks[i]);
-    }
-    if (p->world_buf && res->pose_world_landmarks) {
-        uint32_t wn = res->pose_world_landmarks_count;
-        if (wn > n) wn = n;
-        for (i = 0; i < wn; ++i) {
-            ngh__pose_copy_landmarks(
-                p->world_buf + (size_t)i * NGH_POSE_LANDMARKS * 4,
-                &res->pose_world_landmarks[i]);
-        }
-    }
-    p->count = (int)n;
-}
-
-static void ngh__pose_infer(ngh_pose *p, const uint8_t *px, size_t size, int w,
-                            int h, int fmt, int rot, uint64_t ts) {
-    ngh__mp_pose_result res;
-    ngh__mp_ipo ipo;
-    void *img = NULL;
-    char *mp_err = NULL;
-    int st;
-
-    p->infer_err = NGH_OK;
-    p->count = 0;
-    p->result_ts = ts;
-
-    if (ngh__make_image(px, size, w, h, fmt, &img, p->error, sizeof(p->error)) !=
-        NGH_OK) {
-        p->infer_err = NGH_ERR_BACKEND;
-        return;
-    }
-
-    memset(&ipo, 0, sizeof(ipo));
-    ipo.rotation_degrees = rot;
-    memset(&res, 0, sizeof(res));
-
-    st = ngh__rt.pose_video(p->lm, img, &ipo, (int64_t)ts, &res, &mp_err);
-    if (st != NGH__MP_STATUS_OK) {
-        ngh__set_err(p->error, sizeof(p->error), "pose detect failed", mp_err);
-        p->infer_err = NGH_ERR_BACKEND;
-    } else {
-        ngh__pose_read_result(p, &res);
-        ngh__rt.pose_close_result(&res);
-    }
-    ngh__rt.image_free(img);
-}
-
-#ifndef NGH_NO_THREADS
-#if defined(_WIN32)
-static DWORD WINAPI ngh__pose_thread(LPVOID arg)
-#else
-static void *ngh__pose_thread(void *arg)
-#endif
-{
-    ngh_pose *p = (ngh_pose *)arg;
-    for (;;) {
-        size_t size;
-        int w, h, fmt, rot;
-        uint64_t ts;
-        ngh__lock(&p->wk.mu);
-        if (!ngh__worker_take(&p->wk, &size, &w, &h, &fmt, &rot, &ts)) {
-            ngh__unlock(&p->wk.mu);
-            break;
-        }
-        ngh__unlock(&p->wk.mu);
-
-        ngh__pose_infer(p, p->wk.scratch, size, w, h, fmt, rot, ts);
-
-        ngh__lock(&p->wk.mu);
-        memcpy(p->pub_lm, p->lm_buf,
-               (size_t)p->max_poses * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-        if (p->pub_world)
-            memcpy(
-                p->pub_world, p->world_buf,
-                (size_t)p->max_poses * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-        p->pub_count = p->count;
-        p->pub_ts = p->result_ts;
-        p->pub_err = p->infer_err;
-        p->pub_valid = 1;
-        ngh__unlock(&p->wk.mu);
-    }
-#if defined(_WIN32)
-    return 0;
-#else
-    return NULL;
-#endif
-}
-#endif /* NGH_NO_THREADS */
 
 ngh_pose *ngh_pose_create(const void *model, size_t model_size,
                           const ngh_pose_options *options) {
     ngh_pose_options opt = options ? *options : ngh_pose_options_default();
     ngh__mp_pose_options mp;
-    ngh_pose *p;
+    ngh__task *t;
+    size_t per[NGH__OUTS];
     char *mp_err = NULL;
     int st;
 
     if (!model || model_size == 0 || opt.max_poses <= 0) return NULL;
     if (ngh_runtime_load(NULL) != NGH_OK) return NULL;
 
-    p = (ngh_pose *)calloc(1, sizeof(ngh_pose));
-    if (!p) return NULL;
-    p->max_poses = opt.max_poses;
-    p->want_world = opt.world_landmarks ? 1 : 0;
-    p->accel = (opt.accel == NGH_ACCEL_GPU) ? NGH_ACCEL_GPU : NGH_ACCEL_CPU;
-
-    p->lm_buf = (float *)calloc((size_t)opt.max_poses * NGH_POSE_LANDMARKS * 4,
-                                sizeof(float));
-    if (p->want_world)
-        p->world_buf = (float *)calloc(
-            (size_t)opt.max_poses * NGH_POSE_LANDMARKS * 4, sizeof(float));
-    if (!p->lm_buf || (p->want_world && !p->world_buf)) {
-        ngh_pose_destroy(p);
-        return NULL;
-    }
+    per[0] = NGH_POSE_LANDMARKS * 4;
+    per[1] = opt.world_landmarks ? NGH_POSE_LANDMARKS * 4 : 0;
+    per[2] = 0;
+    t = ngh__task_new(sizeof(ngh_pose), NGH__KIND_POSE, opt.max_poses, per,
+                      opt.accel);
+    if (!t) return NULL;
 
     memset(&mp, 0, sizeof(mp));
     mp.base_options.model_asset_buffer = (const char *)model;
@@ -1756,134 +1692,36 @@ ngh_pose *ngh_pose_create(const void *model, size_t model_size,
     mp.min_tracking_confidence = opt.min_tracking_confidence;
     mp.output_segmentation_masks = 0; /* large GPU readback for no gain here */
 
-    st = ngh__rt.pose_create(&mp, &p->lm, &mp_err);
-    if (st != NGH__MP_STATUS_OK || !p->lm) {
-        p->state = NGH_FAILED;
-        ngh__set_err(p->error, sizeof(p->error), "MpPoseLandmarkerCreate failed",
-                     mp_err);
-        return p;
-    }
-    p->state = NGH_READY;
-
-#ifndef NGH_NO_THREADS
-    if (opt.threaded) {
-        p->pub_lm = (float *)calloc(
-            (size_t)opt.max_poses * NGH_POSE_LANDMARKS * 4, sizeof(float));
-        if (p->want_world)
-            p->pub_world = (float *)calloc(
-                (size_t)opt.max_poses * NGH_POSE_LANDMARKS * 4, sizeof(float));
-        if (!p->pub_lm || (p->want_world && !p->pub_world)) {
-            ngh_pose_destroy(p);
-            return NULL;
-        }
-        ngh__mutex_init(&p->wk.mu);
-        ngh__cond_init(&p->wk.cv);
-#if defined(_WIN32)
-        p->wk.thread = CreateThread(NULL, 0, ngh__pose_thread, p, 0, NULL);
-        p->wk.started = p->wk.thread != NULL;
-#else
-        p->wk.started =
-            pthread_create(&p->wk.thread, NULL, ngh__pose_thread, p) == 0;
-#endif
-        if (!p->wk.started) {
-            ngh__cond_destroy(&p->wk.cv);
-            ngh__mutex_destroy(&p->wk.mu);
-        }
-        p->threaded = p->wk.started;
-    }
-#endif
-    return p;
+    st = ngh__rt.pose_create(&mp, &t->lm, &mp_err);
+    return (ngh_pose *)ngh__task_created(t, st, mp_err, opt.threaded);
 }
 
 ngh_state ngh_pose_state(const ngh_pose *p) {
-    return p ? p->state : NGH_FAILED;
+    return p ? p->t.state : NGH_FAILED;
 }
 
 const char *ngh_pose_error(const ngh_pose *p) {
     if (!p) return ngh_runtime_error();
-    return p->error[0] ? p->error : NULL;
+    return p->t.error[0] ? p->t.error : NULL;
 }
 
 ngh_accel ngh_pose_accel(const ngh_pose *p) {
-    return p ? p->accel : NGH_ACCEL_CPU;
+    return p ? p->t.accel : NGH_ACCEL_CPU;
 }
 
 int ngh_pose_detect(ngh_pose *p, const ngh_image *image, uint64_t ts_ms,
                     ngh_pose_result *out) {
-    const uint8_t *px;
-    size_t size;
-    int fmt, rc;
-
+    float *outs[NGH__OUTS];
     if (!p || !out || !out->landmarks) return NGH_ERR_INVALID_ARG;
-    if (p->state != NGH_READY) return NGH_ERR_NOT_READY;
-    if (!ngh__image_valid(image) || image->kind != NGH_IMAGE_PIXELS)
-        return NGH_ERR_INVALID_ARG;
-    if (out->capacity < p->max_poses) return NGH_ERR_CAPACITY;
-    if (p->have_ts && ts_ms <= p->last_ts) return NGH_ERR_TIMESTAMP;
-    p->last_ts = ts_ms;
-    p->have_ts = 1;
-
-    rc = ngh__pack_rows(image, &p->pack, &p->pack_cap, &px, &size);
-    if (rc != NGH_OK) return rc;
-    fmt = (image->format == NGH_PIXFMT_RGBA8) ? NGH__MP_FMT_SRGBA
-                                              : NGH__MP_FMT_SRGB;
-
-#ifndef NGH_NO_THREADS
-    if (p->threaded) {
-        int have;
-        ngh__lock(&p->wk.mu);
-        rc = ngh__worker_submit(&p->wk, px, size, image->width, image->height,
-                                fmt, image->rotation_degrees, ts_ms);
-        have = p->pub_valid;
-        if (have) {
-            int n = p->pub_count;
-            memcpy(out->landmarks, p->pub_lm,
-                   (size_t)n * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-            if (out->world_landmarks && p->pub_world)
-                memcpy(out->world_landmarks, p->pub_world,
-                       (size_t)n * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-            out->count = n;
-            out->timestamp_ms = p->pub_ts;
-        } else {
-            out->count = 0;
-            out->timestamp_ms = 0;
-        }
-        ngh__unlock(&p->wk.mu);
-        if (rc != NGH_OK) return rc;
-        if (have && p->pub_err != NGH_OK) return p->pub_err;
-        return out->count;
-    }
-#endif
-
-    ngh__pose_infer(p, px, size, image->width, image->height, fmt,
-                    image->rotation_degrees, ts_ms);
-    if (p->infer_err != NGH_OK) return p->infer_err;
-    memcpy(out->landmarks, p->lm_buf,
-           (size_t)p->count * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-    if (out->world_landmarks && p->world_buf)
-        memcpy(out->world_landmarks, p->world_buf,
-               (size_t)p->count * NGH_POSE_LANDMARKS * 4 * sizeof(float));
-    out->count = p->count;
-    out->timestamp_ms = ts_ms;
-    return p->count;
+    outs[0] = out->landmarks;
+    outs[1] = out->world_landmarks;
+    outs[2] = NULL;
+    return ngh__task_detect(&p->t, image, ts_ms, outs, out->capacity,
+                            &out->count, &out->timestamp_ms);
 }
 
 void ngh_pose_destroy(ngh_pose *p) {
-    if (!p) return;
-#ifndef NGH_NO_THREADS
-    if (p->threaded) ngh__worker_destroy(&p->wk);
-    free(p->pub_lm);
-    free(p->pub_world);
-#endif
-    if (p->lm && ngh__rt.pose_close) {
-        char *mp_err = NULL;
-        ngh__rt.pose_close(p->lm, &mp_err);
-        if (mp_err && ngh__rt.error_free) ngh__rt.error_free(mp_err);
-    }
-    free(p->lm_buf);
-    free(p->world_buf);
-    free(p->pack);
-    free(p);
+    if (p) ngh__task_destroy(&p->t);
 }
 
 #else /* __EMSCRIPTEN__ */
