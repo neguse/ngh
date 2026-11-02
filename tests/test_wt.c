@@ -148,6 +148,8 @@ static void test_unload(void) {
 }
 
 int main(void) {
+    /* unbuffered, so a crash still shows how far the run got */
+    setvbuf(stdout, NULL, _IONBF, 0);
     test_args();
 
     if (ngh_wt_runtime_load(NULL) != 0) {
