@@ -70,8 +70,9 @@ typedef struct ngh_wtb_options {
     const uint8_t* cert_hashes;
     size_t cert_hash_count;
     uint32_t idle_timeout_ms;   /* 0 = backend default */
-    uint32_t connect_timeout_ms;/* 0 = backend default; PENDING turns ERROR
-                                 * when it expires */
+    uint32_t connect_timeout_ms;/* 0 = backend default; counted from
+                                 * connect(), name resolution included;
+                                 * PENDING turns ERROR when it expires */
 } ngh_wtb_options;
 
 /* ABI version of the loaded backend. The loader calls this first and

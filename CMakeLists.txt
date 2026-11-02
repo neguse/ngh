@@ -196,6 +196,19 @@ if(NGH_BUILD_TESTS)
         add_test(NAME test_wt COMMAND test_wt)
         set_tests_properties(test_wt PROPERTIES SKIP_RETURN_CODE 77)
 
+        # Slow name resolution must not stall the polling API. An
+        # LD_PRELOAD shim makes every getaddrinfo() take 800ms; Linux only.
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_library(ngh_slow_getaddrinfo SHARED tests/slow_getaddrinfo.c)
+            target_link_libraries(ngh_slow_getaddrinfo PRIVATE ${CMAKE_DL_LIBS})
+            ngh_add_program(test_wt_dns tests/test_wt_dns.c)
+            target_include_directories(test_wt_dns PRIVATE tests)
+            add_test(NAME test_wt_dns COMMAND test_wt_dns)
+            set_tests_properties(test_wt_dns PROPERTIES
+                SKIP_RETURN_CODE 77
+                ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:ngh_slow_getaddrinfo>;NGH_TEST_DNS_DELAY_MS=800")
+        endif()
+
         # Cross-stack interop: our picoquic client against a quinn-based
         # wtransport echo server (tests/wt-echo, Rust). Opt-in because it
         # compiles a cargo project and opens a localhost UDP port.
