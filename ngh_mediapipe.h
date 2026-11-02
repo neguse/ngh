@@ -1976,7 +1976,7 @@ EM_JS(int, ngh__web_create,
        int flag_b), {
     const S = globalThis.__NGH;
     const handle = S.tasks.length;
-    const entry = {task : null, state : 0, error : null, accel : 1};
+    const entry = {task : null, state : 0, error : null, accel : 1, dead : false};
     S.tasks.push(entry);
 
     /* MediaPipe keeps its own copy, but the wasm heap can move under us before
@@ -2010,11 +2010,12 @@ EM_JS(int, ngh__web_create,
         const make = kind === 0 ? S.mod.FaceLandmarker : S.mod.PoseLandmarker;
         const wanted = accel === 1 ? "CPU" : "GPU";
         base.baseOptions.delegate = wanted;
+        let task = null;
         try {
-            entry.task = await make.createFromOptions(S.fileset, base);
+            task = await make.createFromOptions(S.fileset, base);
             entry.accel = wanted === "GPU" ? 2 : 1;
         } catch (e) {
-            if (wanted === "CPU") {
+            if (wanted === "CPU" || entry.dead) {
                 entry.state = 2;
                 entry.error = String(e);
                 return;
@@ -2023,7 +2024,7 @@ EM_JS(int, ngh__web_create,
              * MediaPipe needs. CPU still works there. */
             base.baseOptions.delegate = "CPU";
             try {
-                entry.task = await make.createFromOptions(S.fileset, base);
+                task = await make.createFromOptions(S.fileset, base);
                 entry.accel = 1;
             } catch (e2) {
                 entry.state = 2;
@@ -2031,6 +2032,13 @@ EM_JS(int, ngh__web_create,
                 return;
             }
         }
+        /* Destroyed while the create was in flight: nobody holds this handle
+         * any more, so the task has to be released here or it leaks. */
+        if (entry.dead) {
+            task.close();
+            return;
+        }
+        entry.task = task;
         entry.state = 1;
     });
     return handle;
@@ -2058,7 +2066,10 @@ EM_JS(void, ngh__web_destroy, (int handle), {
     const S = globalThis.__NGH;
     const e = S.tasks[handle];
     if (!e) return;
+    /* A create still in flight sees `dead` and closes what it made. */
+    e.dead = true;
     if (e.task) e.task.close();
+    e.task = null;
     S.tasks[handle] = null;
 })
 
