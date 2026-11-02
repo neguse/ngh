@@ -4,10 +4,12 @@
 //!
 //! Serves a self-signed certificate and prints `cert_sha256=<hex>` on
 //! startup -- the client pins that hash, serverCertificateHashes-style.
-//! Echoes every datagram and every bidirectional stream of any session.
+//! Echoes every datagram and every bidirectional stream of any session, and
+//! reports each bidi stream's end as a datagram (see handle_inner).
 
 use std::net::SocketAddr;
 use wtransport::endpoint::IncomingSession;
+use wtransport::error::StreamReadError;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
 #[tokio::main]
@@ -70,22 +72,38 @@ async fn handle_inner(incoming: IncomingSession, id: u64) -> anyhow::Result<()> 
             }
             s = conn.accept_bi() => {
                 let (mut tx, mut rx) = s?;
+                let conn = conn.clone();
                 tokio::spawn(async move {
+                    // Echo until the client's side ends, then report how it
+                    // ended as a datagram ("stream-fin <bytes>",
+                    // "stream-reset <code> <bytes>") so clients can check
+                    // what their teardown put on the wire. A stopped echo
+                    // (client cancelled reading) keeps draining the input.
                     let mut buf = vec![0u8; 65536];
-                    loop {
+                    let mut total: u64 = 0;
+                    let mut echo = true;
+                    let end = loop {
                         match rx.read(&mut buf).await {
                             Ok(Some(n)) => {
-                                if tx.write_all(&buf[..n]).await.is_err() {
-                                    break;
+                                total += n as u64;
+                                if echo && tx.write_all(&buf[..n]).await.is_err() {
+                                    echo = false;
                                 }
                             }
                             Ok(None) => {
-                                let _ = tx.finish().await;
-                                break;
+                                if echo {
+                                    let _ = tx.finish().await;
+                                }
+                                break format!("stream-fin {total}");
                             }
-                            Err(_) => break,
+                            Err(StreamReadError::Reset(code)) => {
+                                break format!("stream-reset {code} {total}");
+                            }
+                            Err(e) => break format!("stream-error {e} {total}"),
                         }
-                    }
+                    };
+                    println!("[{id}] {end}");
+                    let _ = conn.send_datagram(end.as_bytes());
                 });
             }
         }

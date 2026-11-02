@@ -198,6 +198,8 @@ if(NGH_BUILD_TESTS)
 
         # Stream backpressure against a live server; run by test_wt_interop.
         ngh_add_program(test_wt_flow tests/test_wt_flow.c)
+        # Stream teardown on the wire; run by test_wt_interop.
+        ngh_add_program(test_wt_teardown tests/test_wt_teardown.c)
 
         # Slow name resolution must not stall the polling API. An
         # LD_PRELOAD shim makes every getaddrinfo() take 800ms; Linux only.
@@ -230,7 +232,8 @@ if(NGH_BUILD_TESTS)
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/wt_interop.py
                              $<TARGET_FILE:ngh_wt_echo>
-                             $<TARGET_FILE:test_wt_flow>)
+                             $<TARGET_FILE:test_wt_flow>
+                             $<TARGET_FILE:test_wt_teardown>)
             set_tests_properties(test_wt_interop PROPERTIES TIMEOUT 700)
         endif()
 
