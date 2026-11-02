@@ -74,7 +74,7 @@ Recorded so they don't get relitigated. Change only with a stated reason.
 - TSan reports hundreds of races — all inside the uninstrumented libmediapipe,
   none from ngh accesses. ASan/UBSan are clean; leak reports trace to
   MediaPipe's global registries under dlopen.
-- Intended consumer: `../lub` (SDL3 submodule, release-3.2.30). CI's
+- Intended consumer: `../lub` (SDL3 submodule, release-3.4.16). CI's
   FetchContent pin for the camera example must track lub's SDL tag.
 - Linux GPU delegate needs `EGL_PLATFORM=surfaceless` when headless.
 - WebTransport backend (2026-08): backend/wt_backend.{h,c} is the shim ABI

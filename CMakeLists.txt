@@ -240,7 +240,7 @@ if(NGH_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
             # The tag lub pins its SDL submodule to; keep them matched.
             FetchContent_Declare(SDL3
                 GIT_REPOSITORY https://github.com/libsdl-org/SDL
-                GIT_TAG release-3.2.30
+                GIT_TAG release-3.4.16
                 GIT_SHALLOW TRUE)
             FetchContent_MakeAvailable(SDL3)
         endif()
