@@ -234,6 +234,8 @@ struct ngh_wtb_stream {
     int finish_requested;
     int fin_sent;
     int dead;
+    int reset_local;  /* the app reset it: nothing more may be sent */
+    int orphan;       /* destroyed after finish(): still flushing to FIN */
     int app_flow;           /* we, not picoquic, extend the peer's credit */
     size_t read_since_grant; /* bytes the app read since the last grant */
     wtb_queue recvq;
@@ -571,7 +573,8 @@ static int wtb_stream_cb(picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
         /* `bytes` is the buffer context for picoquic_provide_stream_data_buffer */
         size_t queued = st->sendq.bytes;
         size_t n = (queued < length) ? queued : length;
-        int fin_now = (st->finish_requested && n == queued && !st->fin_sent);
+        int fin_now = (st->finish_requested && n == queued && !st->fin_sent &&
+            !st->reset_local);
         int still_active = (queued > n) ? 1 : 0;
         uint8_t* buf = picoquic_provide_stream_data_buffer(bytes, n,
             fin_now, still_active);
@@ -853,6 +856,16 @@ static void wtb_do_session_teardown(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
     for (st = s->streams; st != NULL; st = st->next) {
         st->hs = NULL;
     }
+    /* Orphans (destroyed while flushing to FIN) have no handle either. */
+    {
+        ngh_wtb_stream* next;
+        for (st = s->streams; st != NULL; st = next) {
+            next = st->next;
+            if (st->orphan) {
+                wtb_stream_free_shell(st);
+            }
+        }
+    }
     /* Streams never accepted have no handle anyone could destroy; free
      * them here so they cannot pin the session forever. */
     while (s->accept_head != NULL) {
@@ -873,6 +886,58 @@ static void wtb_do_session_teardown(ngh_wtb_ctx* ctx, ngh_wtb_session* s)
         }
     }
     wtb_session_unref(s);
+}
+
+/* Network thread. picowt_reset_stream sends RESET_STREAM_AT for a local
+ * stream (so the WT stream header stays reliable), which needs the peer's
+ * reset_stream_at transport parameter; picoquic refuses it otherwise and
+ * sends nothing -- and quinn/quic-go era servers, the ones the compat
+ * patch exists for, do not offer it. Fall back to a plain RESET_STREAM. */
+static void wtb_reset_stream(picoquic_cnx_t* cnx, h3zero_stream_ctx_t* hs,
+    uint64_t code)
+{
+    if (picowt_reset_stream(cnx, hs, code) != 0) {
+        (void)picoquic_reset_stream(cnx, hs->stream_id, code);
+        hs->ps.stream_state.is_fin_sent = 1;
+    }
+}
+
+/* Network thread. Unhooks the shell from h3zero, which keeps managing the
+ * stream's lifecycle, and frees it. */
+static void wtb_release_shell(ngh_wtb_stream* st)
+{
+    if (st->hs != NULL) {
+        st->hs->path_callback = NULL;
+        st->hs->path_callback_ctx = NULL;
+        st->hs = NULL;
+    }
+    wtb_stream_free_shell(st);
+}
+
+/* Network thread. Destroying a handle ends the stream on the wire the way
+ * the browser backend does: the read side is cancelled (STOP_SENDING), the
+ * write side is reset -- unless finish() was called, in which case the
+ * queued bytes and the FIN still go out and the shell lingers as an orphan
+ * until they have. */
+static void wtb_do_stream_destroy(ngh_wtb_session* s, ngh_wtb_stream* st)
+{
+    int can_read = st->bidi || !st->is_local;
+    int can_write = st->bidi || st->is_local;
+
+    if (st->hs != NULL && s->cnx != NULL) {
+        if (can_read && !st->fin_received && !st->reset_received) {
+            (void)picoquic_stop_sending(s->cnx, st->hs->stream_id, 0);
+        }
+        if (can_write && !st->fin_sent && !st->reset_local) {
+            if (st->finish_requested) {
+                st->orphan = 1;
+                return;
+            }
+            /* may free the h3zero context, clearing st->hs via callback */
+            wtb_reset_stream(s->cnx, st->hs, 0);
+        }
+    }
+    wtb_release_shell(st);
 }
 
 static void wtb_process_ops(ngh_wtb_ctx* ctx)
@@ -908,9 +973,10 @@ static void wtb_process_ops(ngh_wtb_ctx* ctx)
             }
             break;
         case WTB_OP_STREAM_RESET:
+            /* hs stays set: h3zero still holds our callback for this stream
+             * and the destroy op has to detach it before freeing the shell. */
             if (op->st->hs != NULL && op->s->cnx != NULL) {
-                (void)picowt_reset_stream(op->s->cnx, op->st->hs, op->code);
-                op->st->hs = NULL;
+                wtb_reset_stream(op->s->cnx, op->st->hs, op->code);
             }
             break;
         case WTB_OP_SESSION_CLOSE:
@@ -930,13 +996,7 @@ static void wtb_process_ops(ngh_wtb_ctx* ctx)
             wtb_do_session_teardown(ctx, op->s);
             break;
         case WTB_OP_STREAM_DESTROY:
-            if (op->st->hs != NULL) {
-                /* detach; h3zero keeps managing the stream lifecycle */
-                op->st->hs->path_callback = NULL;
-                op->st->hs->path_callback_ctx = NULL;
-                op->st->hs = NULL;
-            }
-            wtb_stream_free_shell(op->st);
+            wtb_do_stream_destroy(op->s, op->st);
             break;
         }
         free(op->reason);
@@ -952,6 +1012,7 @@ static void wtb_pump(ngh_wtb_ctx* ctx)
     wtb_process_ops(ctx);
     for (s = ctx->sessions; s != NULL; s = s->next) {
         ngh_wtb_stream* st;
+        ngh_wtb_stream* next;
         if (s->state == NGH_WTB_PENDING && now > s->connect_deadline) {
             wtb_session_fail(s, "connect timeout");
             if (s->cnx != NULL) {
@@ -974,9 +1035,14 @@ static void wtb_pump(ngh_wtb_ctx* ctx)
         if (s->dgram_sendq.head != NULL && s->state == NGH_WTB_READY) {
             (void)h3zero_set_datagram_ready(s->cnx, s->control_id);
         }
-        for (st = s->streams; st != NULL; st = st->next) {
+        for (st = s->streams; st != NULL; st = next) {
+            next = st->next;
+            if (st->orphan && (st->fin_sent || st->hs == NULL)) {
+                wtb_release_shell(st);
+                continue;
+            }
             wtb_grant_credit(s->cnx, st);
-            if (st->hs != NULL &&
+            if (st->hs != NULL && !st->reset_local &&
                 (st->sendq.bytes > 0 ||
                     (st->finish_requested && !st->fin_sent))) {
                 (void)picoquic_mark_active_stream(s->cnx, st->hs->stream_id,
@@ -1632,6 +1698,7 @@ void ngh_wtb_stream_reset(ngh_wtb_stream* st, uint32_t error_code)
     wtb_mutex_lock(&st->s->ctx->lock);
     /* dead both ways from the caller's point of view, immediately */
     st->reset_received = 1;
+    st->reset_local = 1;
     wtb_queue_clear(&st->sendq);
     wtb_op_push(st->s->ctx, WTB_OP_STREAM_RESET, st->s, st, error_code, NULL);
     wtb_mutex_unlock(&st->s->ctx->lock);

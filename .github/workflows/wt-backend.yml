@@ -30,12 +30,14 @@ jobs:
             test_bin: build/test_wt
             client_bin: build/ngh_wt_echo
             flow_bin: build/test_wt_flow
+            teardown_bin: build/test_wt_teardown
           - name: windows-x64
             os: windows-2022
             artifact: build/Release/ngh_wt_backend.dll
             test_bin: build/Release/test_wt.exe
             client_bin: build/Release/ngh_wt_echo.exe
             flow_bin: build/Release/test_wt_flow.exe
+            teardown_bin: build/Release/test_wt_teardown.exe
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -74,7 +76,7 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DNGH_WERROR=ON ${{ env.NGH_TOOLCHAIN_ARGS }}
 
       - name: Build
-        run: cmake --build build --config Release --parallel --target ngh_wt_backend ngh_wt_backend_check test_wt test_wt_flow ngh_wt_echo
+        run: cmake --build build --config Release --parallel --target ngh_wt_backend ngh_wt_backend_check test_wt test_wt_flow test_wt_teardown ngh_wt_echo
 
       # test_wt loads the backend from beside the test binary and exercises
       # the failure paths. Run the binary directly rather than through
@@ -88,10 +90,11 @@ jobs:
       # certificate, datagram, bidi stream, capsule close) against the
       # quinn-based wtransport echo server on localhost, then stream
       # backpressure (writes stall while we do not read, every byte comes
-      # back once we do).
+      # back once we do), then stream teardown (what a destroyed handle puts
+      # on the wire).
       - name: Interop test
         shell: bash
-        run: python tests/wt_interop.py ./${{ matrix.client_bin }} ./${{ matrix.flow_bin }}
+        run: python tests/wt_interop.py ./${{ matrix.client_bin }} ./${{ matrix.flow_bin }} ./${{ matrix.teardown_bin }}
 
       - uses: actions/upload-artifact@v4
         with:

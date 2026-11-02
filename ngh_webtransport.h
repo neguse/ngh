@@ -98,6 +98,10 @@
  * - ngh_wt_stream_read() interleaves nothing: bytes arrive in order, FIN
  *   only after all data was consumed. A peer reset surfaces as
  *   NGH_WT_ERR_RESET instead.
+ * - ngh_wt_stream_destroy() ends the stream on the wire, as the browser
+ *   does: after ngh_wt_stream_finish() the queued bytes and the FIN still
+ *   go out; otherwise the peer sees the stream reset. Unread incoming data
+ *   is discarded and the peer is asked to stop sending.
  * - Handles stay valid until their *_destroy call, whatever the state.
  *   Destroying the session does not destroy its stream handles; destroy
  *   them independently.
