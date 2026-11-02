@@ -46,6 +46,10 @@ static void wtb_mutex_init(wtb_mutex_t* m) { InitializeCriticalSection(m); }
 static void wtb_mutex_destroy(wtb_mutex_t* m) { DeleteCriticalSection(m); }
 static void wtb_mutex_lock(wtb_mutex_t* m) { EnterCriticalSection(m); }
 static void wtb_mutex_unlock(wtb_mutex_t* m) { LeaveCriticalSection(m); }
+static void wtb_sleep_ms(unsigned ms) { Sleep(ms); }
+typedef SOCKET wtb_socket_t;
+#define WTB_BAD_SOCKET INVALID_SOCKET
+#define wtb_closesocket closesocket
 #else
 #include <pthread.h>
 typedef pthread_mutex_t wtb_mutex_t;
@@ -59,12 +63,26 @@ static void wtb_mutex_init(wtb_mutex_t* m) {
 static void wtb_mutex_destroy(wtb_mutex_t* m) { pthread_mutex_destroy(m); }
 static void wtb_mutex_lock(wtb_mutex_t* m) { pthread_mutex_lock(m); }
 static void wtb_mutex_unlock(wtb_mutex_t* m) { pthread_mutex_unlock(m); }
+#include <time.h>
+#include <unistd.h>
+static void wtb_sleep_ms(unsigned ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+typedef int wtb_socket_t;
+#define WTB_BAD_SOCKET (-1)
+#define wtb_closesocket close
 #endif
 
 #define WTB_STREAM_SENDQ_MAX (1u << 20)
 #define WTB_DGRAM_QUEUE_MAX 64
 #define WTB_ACCEPT_QUEUE_MAX 64
 #define WTB_CONNECT_TIMEOUT_MS_DEFAULT 10000
+/* How long ctx_create waits for the packet loop to come up. */
+#define WTB_LOOP_START_TIMEOUT_MS 2000
 /* Reported before the path is measured; QUIC guarantees at least a 1200
  * byte UDP payload, minus QUIC + H3 datagram overhead. */
 #define WTB_DGRAM_MAX_SAFE 1150
@@ -234,6 +252,7 @@ struct ngh_wtb_ctx {
     wtb_op* op_head;
     wtb_op* op_tail;
     ngh_wtb_session* sessions;
+    int loop_ready; /* the packet loop opened its sockets; under lock */
     ptls_verify_certificate_t verifier;
     char err[256];
 };
@@ -832,6 +851,9 @@ static int wtb_loop_cb(picoquic_quic_t* quic,
             /* enable wake-up support */
             ((picoquic_packet_loop_options_t*)callback_arg)->do_time_check = 1;
         }
+        wtb_mutex_lock(&ctx->lock);
+        ctx->loop_ready = 1;
+        wtb_mutex_unlock(&ctx->lock);
         break;
     case picoquic_packet_loop_time_check: {
         /* bound the sleep so timeouts and state polls stay responsive */
@@ -864,6 +886,48 @@ uint32_t ngh_wtb_abi_version(void)
     return NGH_WTB_ABI_VERSION;
 }
 
+/* Address families the packet loop should open. picoquic's AF_UNSPEC
+ * opens an IPv4 and an IPv6 socket and gives up entirely when either fails,
+ * so a host without IPv6 (common in containers) or without IPv4 would get
+ * no packet loop at all. Probe both and ask only for what exists. */
+static int wtb_local_af(void)
+{
+    int have4 = 0, have6 = 0;
+    wtb_socket_t fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd != WTB_BAD_SOCKET) {
+        have4 = 1;
+        wtb_closesocket(fd);
+    }
+    fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd != WTB_BAD_SOCKET) {
+        have6 = 1;
+        wtb_closesocket(fd);
+    }
+    if (have4 && !have6) {
+        return AF_INET;
+    }
+    if (have6 && !have4) {
+        return AF_INET6;
+    }
+    return AF_UNSPEC;
+}
+
+static int wtb_wait_loop_ready(ngh_wtb_ctx* ctx)
+{
+    unsigned waited;
+    for (waited = 0; waited < WTB_LOOP_START_TIMEOUT_MS; waited++) {
+        int ready;
+        wtb_mutex_lock(&ctx->lock);
+        ready = ctx->loop_ready;
+        wtb_mutex_unlock(&ctx->lock);
+        if (ready) {
+            return 1;
+        }
+        wtb_sleep_ms(1);
+    }
+    return 0;
+}
+
 ngh_wtb_ctx* ngh_wtb_ctx_create(void)
 {
     ngh_wtb_ctx* ctx = (ngh_wtb_ctx*)calloc(1, sizeof(ngh_wtb_ctx));
@@ -890,11 +954,22 @@ ngh_wtb_ctx* ngh_wtb_ctx_create(void)
     ctx->verifier.algos = wtb_verify_algos;
     picoquic_set_verify_certificate_callback(ctx->quic, &ctx->verifier, NULL);
 
-    ctx->loop_param.local_af = AF_UNSPEC;
+    ctx->loop_param.local_af = wtb_local_af();
     ctx->net = picoquic_start_network_thread(ctx->quic, &ctx->loop_param,
         wtb_loop_cb, ctx, &thread_ret);
     if (ctx->net == NULL) {
         picoquic_free(ctx->quic);
+        wtb_mutex_destroy(&ctx->lock);
+        free(ctx);
+        return NULL;
+    }
+    /* picoquic reports a loop that could not start only by its thread
+     * exiting; without this wait every session would sit in PENDING with
+     * no packet loop to ever move it. */
+    if (!wtb_wait_loop_ready(ctx)) {
+        picoquic_delete_network_thread(ctx->net);
+        picoquic_free(ctx->quic);
+        wtb_mutex_destroy(&ctx->lock);
         free(ctx);
         return NULL;
     }
