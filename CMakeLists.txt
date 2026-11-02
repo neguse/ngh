@@ -149,6 +149,20 @@ if(NGH_BUILD_TESTS)
         add_test(NAME test_web
                  COMMAND node $<TARGET_FILE:test_web>)
 
+        # Task lifecycle (destroy while PENDING, GPU -> CPU retry) against a
+        # fake tasks-vision bundle; needs no browser and no network.
+        add_executable(test_web_lifecycle tests/test_web_lifecycle.c)
+        target_link_libraries(test_web_lifecycle PRIVATE ngh)
+        target_include_directories(test_web_lifecycle PRIVATE tests)
+        target_compile_options(test_web_lifecycle PRIVATE ${NGH_WARNINGS})
+        target_compile_definitions(test_web_lifecycle PRIVATE
+            NGH_FAKE_BUNDLE="file://${CMAKE_CURRENT_SOURCE_DIR}/tests/web_fake_tasks_vision.mjs")
+        set_target_properties(test_web_lifecycle PROPERTIES
+            SUFFIX ".js"
+            LINK_FLAGS "-sENVIRONMENT=node -sEXIT_RUNTIME=1")
+        add_test(NAME test_web_lifecycle
+                 COMMAND node $<TARGET_FILE:test_web_lifecycle>)
+
         # The coordinate helpers are pure math and identical on every
         # platform; run that part under node too.
         add_executable(test_space tests/test_space.c)
