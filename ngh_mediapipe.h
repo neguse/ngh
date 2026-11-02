@@ -86,8 +86,10 @@
  * Windows cannot use the GPU, and it is not a packaging problem: upstream's
  * only desktop GPU path is a GL ES compute shader, there is no WGL context
  * implementation in the tree, and mediapipe/gpu/BUILD disables GPU for
- * os:windows unconditionally. accel is therefore a HINT; ask
- * ngh_face_accel() / ngh_pose_accel() what is actually running.
+ * os:windows unconditionally. accel is therefore a HINT: a GPU request
+ * that cannot be met (Windows, no GPU, no EGL) falls back to the CPU on
+ * every platform instead of failing creation. Ask ngh_face_accel() /
+ * ngh_pose_accel() what is actually running.
  *
  * That limit matters less than it sounds. Measured on a Ryzen 7 PRO 5750GE
  * with a Vega iGPU (VIDEO mode, p50 over 270 frames):
@@ -215,7 +217,7 @@ typedef enum ngh_state {
 typedef enum ngh_accel {
     NGH_ACCEL_AUTO = 0, /* GPU where it helps, CPU otherwise */
     NGH_ACCEL_CPU = 1,
-    NGH_ACCEL_GPU = 2
+    NGH_ACCEL_GPU = 2   /* falls back to the CPU when the GPU path fails */
 } ngh_accel;
 
 enum {
@@ -1514,16 +1516,56 @@ static void ngh__task_destroy(ngh__task *t) {
     free(t);
 }
 
-/* Finishes creation after the kind-specific create call. Returns the task,
- * or NULL (task freed) when the worker could not be allocated. */
-static ngh__task *ngh__task_created(ngh__task *t, int st, char *mp_err,
-                                    int threaded) {
-    if (st != NGH__MP_STATUS_OK || !t->lm) {
+static int ngh__task_mp_create_once(ngh__task *t, void *mp_opts,
+                                    char **mp_err) {
+    *mp_err = NULL;
+    t->lm = NULL;
+    return t->kind == NGH__KIND_FACE
+               ? ngh__rt.face_create((ngh__mp_face_options *)mp_opts, &t->lm,
+                                     mp_err)
+               : ngh__rt.pose_create((ngh__mp_pose_options *)mp_opts, &t->lm,
+                                     mp_err);
+}
+
+/* Runs the kind-specific create. `base` points into `mp_opts`. A GPU request
+ * that fails is retried on the CPU, as on the web: accel is a hint, and the
+ * GPU path is missing on Windows and on hosts without EGL. On failure the
+ * message is left in t->error. */
+static int ngh__task_mp_create(ngh__task *t, void *mp_opts,
+                               ngh__mp_base_options *base) {
+    const char *what = t->kind == NGH__KIND_FACE
+                           ? "MpFaceLandmarkerCreate failed"
+                           : "MpPoseLandmarkerCreate failed";
+    char *mp_err = NULL;
+    char gpu_err[256];
+    int st = ngh__task_mp_create_once(t, mp_opts, &mp_err);
+
+    if (st == NGH__MP_STATUS_OK && t->lm) return st;
+    if (base->delegate != NGH__MP_DELEGATE_GPU) {
+        ngh__set_err(t->error, sizeof(t->error), what, mp_err);
+        return st != NGH__MP_STATUS_OK ? st : -1;
+    }
+
+    ngh__set_err(gpu_err, sizeof(gpu_err), what, mp_err);
+    base->delegate = NGH__MP_DELEGATE_CPU;
+    t->accel = NGH_ACCEL_CPU;
+    st = ngh__task_mp_create_once(t, mp_opts, &mp_err);
+    if (st == NGH__MP_STATUS_OK && t->lm) return st;
+
+    {
+        char cpu_err[256];
+        ngh__set_err(cpu_err, sizeof(cpu_err), what, mp_err);
+        snprintf(t->error, sizeof(t->error), "%.240s (CPU retry: %.240s)", gpu_err,
+                 cpu_err);
+    }
+    return st != NGH__MP_STATUS_OK ? st : -1;
+}
+
+/* Finishes creation after ngh__task_mp_create. Returns the task, or NULL
+ * (task freed) when the worker could not be allocated. */
+static ngh__task *ngh__task_created(ngh__task *t, int st, int threaded) {
+    if (st != NGH__MP_STATUS_OK) {
         t->state = NGH_FAILED;
-        ngh__set_err(t->error, sizeof(t->error),
-                     t->kind == NGH__KIND_FACE ? "MpFaceLandmarkerCreate failed"
-                                               : "MpPoseLandmarkerCreate failed",
-                     mp_err);
         return t; /* keep the handle so the caller can read the message */
     }
     t->state = NGH_READY;
@@ -1603,7 +1645,6 @@ ngh_face *ngh_face_create(const void *model, size_t model_size,
     ngh__mp_face_options mp;
     ngh__task *t;
     size_t per[NGH__OUTS];
-    char *mp_err = NULL;
     int st;
 
     if (!model || model_size == 0 || opt.max_faces <= 0) return NULL;
@@ -1628,8 +1669,8 @@ ngh_face *ngh_face_create(const void *model, size_t model_size,
     mp.output_face_blendshapes = (unsigned char)(per[1] != 0);
     mp.output_facial_transformation_matrixes = (unsigned char)(per[2] != 0);
 
-    st = ngh__rt.face_create(&mp, &t->lm, &mp_err);
-    return (ngh_face *)ngh__task_created(t, st, mp_err, opt.threaded);
+    st = ngh__task_mp_create(t, &mp, &mp.base_options);
+    return (ngh_face *)ngh__task_created(t, st, opt.threaded);
 }
 
 ngh_state ngh_face_state(const ngh_face *f) {
@@ -1668,7 +1709,6 @@ ngh_pose *ngh_pose_create(const void *model, size_t model_size,
     ngh__mp_pose_options mp;
     ngh__task *t;
     size_t per[NGH__OUTS];
-    char *mp_err = NULL;
     int st;
 
     if (!model || model_size == 0 || opt.max_poses <= 0) return NULL;
@@ -1692,8 +1732,8 @@ ngh_pose *ngh_pose_create(const void *model, size_t model_size,
     mp.min_tracking_confidence = opt.min_tracking_confidence;
     mp.output_segmentation_masks = 0; /* large GPU readback for no gain here */
 
-    st = ngh__rt.pose_create(&mp, &t->lm, &mp_err);
-    return (ngh_pose *)ngh__task_created(t, st, mp_err, opt.threaded);
+    st = ngh__task_mp_create(t, &mp, &mp.base_options);
+    return (ngh_pose *)ngh__task_created(t, st, opt.threaded);
 }
 
 ngh_state ngh_pose_state(const ngh_pose *p) {

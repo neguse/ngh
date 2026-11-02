@@ -307,6 +307,44 @@ done:
     NGH_TEST_DONE();
 }
 
+/* accel is a hint: a GPU request on a host that cannot honour it (Windows,
+ * no GPU, no EGL) must still produce a working task, and report CPU. */
+static void test_gpu_request_falls_back(void) {
+    ngh_face_options opt = ngh_face_options_default();
+    ngh_face_result r;
+    ngh_face *f;
+    unsigned char junk[64];
+
+    NGH_TEST_CASE("GPU request falls back to the CPU");
+    opt.accel = NGH_ACCEL_GPU;
+    opt.threaded = 0;
+    opt.blendshapes = 0;
+    f = ngh_face_create(g_model, g_model_size, &opt);
+    NGH_CHECK(f != NULL);
+    NGH_CHECK_EQ_INT(ngh_face_state(f), NGH_READY);
+    NGH_CHECK(ngh_face_error(f) == NULL);
+    printf("    (running on %s)\n",
+           ngh_face_accel(f) == NGH_ACCEL_GPU ? "GPU" : "CPU");
+    NGH_CHECK_EQ_INT(ngh_face_result_alloc(&r, 1, 0, 0), NGH_OK);
+    {
+        ngh_image img = ngh_image_rgb(g_portrait, g_w, g_h, 0);
+        NGH_CHECK_EQ_INT(ngh_face_detect(f, &img, 1, &r), 1);
+    }
+    ngh_face_result_free(&r);
+    ngh_face_destroy(f);
+    NGH_TEST_DONE();
+
+    NGH_TEST_CASE("a model that fails on both reports both errors");
+    memset(junk, 0x5a, sizeof(junk));
+    f = ngh_face_create(junk, sizeof(junk), &opt);
+    NGH_CHECK(f != NULL);
+    NGH_CHECK_EQ_INT(ngh_face_state(f), NGH_FAILED);
+    NGH_CHECK(ngh_face_error(f) != NULL &&
+              strstr(ngh_face_error(f), "CPU retry") != NULL);
+    ngh_face_destroy(f);
+    NGH_TEST_DONE();
+}
+
 static void test_pose_smoke(void) {
     ngh_pose_options opt = ngh_pose_options_default();
     ngh_pose_result r;
@@ -391,6 +429,7 @@ int main(int argc, char **argv) {
     test_timestamp_monotonic();
     test_strided_input();
     test_threaded_matches_sync();
+    test_gpu_request_falls_back();
     test_pose_smoke();
 
     free(g_model);
