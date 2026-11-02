@@ -268,7 +268,7 @@ typedef struct ngh_image {
     const uint8_t *pixels;
     int width;
     int height;
-    int stride; /* bytes per row; 0 means tightly packed */
+    int stride; /* bytes per row, >= width * bytes per pixel; 0 = packed */
     ngh_pixfmt format;
     int web_source;       /* NGH_IMAGE_WEB only */
     int rotation_degrees; /* clockwise, must be a multiple of 90 */
@@ -674,19 +674,40 @@ void ngh_pose_result_free(ngh_pose_result *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* Rows are copied into a tightly packed scratch buffer when the source is
- * strided; MediaPipe's MpImageCreateFromUint8Data wants contiguous pixels. */
+static size_t ngh__image_row(const ngh_image *img) {
+    int bpp = (img->format == NGH_PIXFMT_RGBA8) ? 4 : 3;
+    return (size_t)img->width * (size_t)bpp;
+}
+
+/* Packed size of the image's pixels. */
+static size_t ngh__image_size(const ngh_image *img) {
+    return ngh__image_row(img) * (size_t)img->height;
+}
+
+/* Copies the rows of `img` tightly packed into dst (ngh__image_size bytes);
+ * MediaPipe's MpImageCreateFromUint8Data wants contiguous pixels. */
+static void ngh__copy_rows(uint8_t *dst, const ngh_image *img) {
+    size_t row = ngh__image_row(img);
+    size_t stride = img->stride > 0 ? (size_t)img->stride : row;
+    int y;
+    if (stride == row) {
+        memcpy(dst, img->pixels, row * (size_t)img->height);
+        return;
+    }
+    for (y = 0; y < img->height; ++y)
+        memcpy(dst + row * (size_t)y, img->pixels + stride * (size_t)y, row);
+}
+
+/* Returns contiguous pixels: the caller's own when already packed, else a
+ * copy in the scratch buffer. */
 static int ngh__pack_rows(const ngh_image *img, uint8_t **buf, size_t *cap,
                           const uint8_t **out_pixels, size_t *out_size) {
-    int bpp = (img->format == NGH_PIXFMT_RGBA8) ? 4 : 3;
-    size_t row = (size_t)img->width * (size_t)bpp;
-    size_t need = row * (size_t)img->height;
-    int stride = img->stride > 0 ? img->stride : (int)row;
-    int y;
+    size_t row = ngh__image_row(img);
+    size_t need = ngh__image_size(img);
 
-    if ((size_t)stride == row) {
+    *out_size = need;
+    if (img->stride == 0 || (size_t)img->stride == row) {
         *out_pixels = img->pixels;
-        *out_size = need;
         return NGH_OK;
     }
     if (*cap < need) {
@@ -695,12 +716,8 @@ static int ngh__pack_rows(const ngh_image *img, uint8_t **buf, size_t *cap,
         *buf = grown;
         *cap = need;
     }
-    for (y = 0; y < img->height; ++y) {
-        memcpy(*buf + row * (size_t)y, img->pixels + (size_t)stride * (size_t)y,
-               row);
-    }
+    ngh__copy_rows(*buf, img);
     *out_pixels = *buf;
-    *out_size = need;
     return NGH_OK;
 }
 
@@ -708,7 +725,14 @@ static int ngh__image_valid(const ngh_image *img) {
     if (!img) return 0;
     if (img->rotation_degrees % 90 != 0) return 0;
     if (img->kind == NGH_IMAGE_WEB) return img->web_source >= 0;
-    return img->pixels && img->width > 0 && img->height > 0;
+    if (!img->pixels || img->width <= 0 || img->height <= 0) return 0;
+    if (img->format != NGH_PIXFMT_RGB8 && img->format != NGH_PIXFMT_RGBA8)
+        return 0;
+    /* A stride shorter than a row would read past the caller's buffer on
+     * the last rows; bottom-up (negative) strides are not supported. */
+    if (img->stride < 0) return 0;
+    if (img->stride > 0 && (size_t)img->stride < ngh__image_row(img)) return 0;
+    return 1;
 }
 
 #ifndef __EMSCRIPTEN__
@@ -1156,21 +1180,23 @@ static void ngh__worker_destroy(ngh__worker *wk) {
     wk->scratch = NULL;
 }
 
-/* Caller must hold wk->mu. */
-static int ngh__worker_submit(ngh__worker *wk, const uint8_t *px, size_t size,
-                              int w, int h, int fmt, int rot, uint64_t ts) {
+/* Caller must hold wk->mu. Packs the frame straight into the pending
+ * buffer: one copy per submitted frame, strided or not. */
+static int ngh__worker_submit(ngh__worker *wk, const ngh_image *img, int fmt,
+                              uint64_t ts) {
+    size_t size = ngh__image_size(img);
     if (wk->pending_cap < size) {
         uint8_t *grown = (uint8_t *)realloc(wk->pending, size);
         if (!grown) return NGH_ERR_OOM;
         wk->pending = grown;
         wk->pending_cap = size;
     }
-    memcpy(wk->pending, px, size);
+    ngh__copy_rows(wk->pending, img);
     wk->pending_size = size;
-    wk->w = w;
-    wk->h = h;
+    wk->w = img->width;
+    wk->h = img->height;
     wk->fmt = fmt;
-    wk->rot = rot;
+    wk->rot = img->rotation_degrees;
     wk->ts = ts;
     wk->pending_valid = 1;
     ngh__cond_signal(&wk->cv);
@@ -1640,8 +1666,6 @@ static int ngh__task_detect(ngh__task *t, const ngh_image *image,
         image = &rgba_image;
     }
 
-    rc = ngh__pack_rows(image, &t->pack, &t->pack_cap, &px, &size);
-    if (rc != NGH_OK) return rc;
     fmt = (image->format == NGH_PIXFMT_RGBA8) ? NGH__MP_FMT_SRGBA
                                               : NGH__MP_FMT_SRGB;
 
@@ -1649,8 +1673,7 @@ static int ngh__task_detect(ngh__task *t, const ngh_image *image,
     if (t->threaded) {
         int have, err;
         ngh__lock(&t->wk.mu);
-        rc = ngh__worker_submit(&t->wk, px, size, image->width, image->height,
-                                fmt, image->rotation_degrees, ts_ms);
+        rc = ngh__worker_submit(&t->wk, image, fmt, ts_ms);
         have = t->pub_valid;
         n = have ? t->pub_count : 0;
         for (i = 0; i < NGH__OUTS; ++i) {
@@ -1667,6 +1690,8 @@ static int ngh__task_detect(ngh__task *t, const ngh_image *image,
     }
 #endif
 
+    rc = ngh__pack_rows(image, &t->pack, &t->pack_cap, &px, &size);
+    if (rc != NGH_OK) return rc;
     ngh__task_infer(t, px, size, image->width, image->height, fmt,
                     image->rotation_degrees, ts_ms);
     if (t->infer_err != NGH_OK) return t->infer_err;
