@@ -100,6 +100,12 @@ typedef int wtb_socket_t;
 #endif
 
 #define WTB_STREAM_SENDQ_MAX (1u << 20)
+/* Most a stream may hold unread on our side. picoquic would otherwise
+ * extend the peer's credit as soon as bytes reach our queue, so a reader
+ * that stops polling would buffer without bound instead of pushing back. */
+#define WTB_STREAM_RECV_WINDOW (1u << 20)
+/* Re-grant credit after the application has read this much... */
+#define WTB_STREAM_RECV_REGRANT (WTB_STREAM_RECV_WINDOW / 8)
 #define WTB_DGRAM_QUEUE_MAX 64
 #define WTB_ACCEPT_QUEUE_MAX 64
 #define WTB_CONNECT_TIMEOUT_MS_DEFAULT 10000
@@ -228,6 +234,8 @@ struct ngh_wtb_stream {
     int finish_requested;
     int fin_sent;
     int dead;
+    int app_flow;           /* we, not picoquic, extend the peer's credit */
+    size_t read_since_grant; /* bytes the app read since the last grant */
     wtb_queue recvq;
     wtb_queue sendq;
 };
@@ -510,6 +518,36 @@ static void wtb_stream_free_shell(ngh_wtb_stream* st)
     wtb_session_unref(s);
 }
 
+/* Network thread. From here on the peer's credit on this stream grows
+ * only as the application reads (wtb_grant_credit). */
+static void wtb_take_flow_control(picoquic_cnx_t* cnx, ngh_wtb_stream* st)
+{
+    if (st->hs != NULL &&
+        picoquic_set_app_flow_control(cnx, st->hs->stream_id, 1) == 0) {
+        st->app_flow = 1;
+    }
+}
+
+/* Network thread, under the lock: tops the peer's credit back up to
+ * WTB_STREAM_RECV_WINDOW past what is unread, once the app has read enough
+ * to make a MAX_STREAM_DATA frame worth sending -- or everything. */
+static void wtb_grant_credit(picoquic_cnx_t* cnx, ngh_wtb_stream* st)
+{
+    if (!st->app_flow || st->hs == NULL || st->read_since_grant == 0 ||
+        st->fin_received || st->reset_received) {
+        return;
+    }
+    if (st->read_since_grant < WTB_STREAM_RECV_REGRANT &&
+        st->recvq.bytes > 0) {
+        return;
+    }
+    if (st->recvq.bytes < WTB_STREAM_RECV_WINDOW) {
+        (void)picoquic_open_flow_control(cnx, st->hs->stream_id,
+            WTB_STREAM_RECV_WINDOW - st->recvq.bytes);
+    }
+    st->read_since_grant = 0;
+}
+
 static int wtb_stream_cb(picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
     picohttp_call_back_event_t event, h3zero_stream_ctx_t* stream_ctx,
     void* v_ctx)
@@ -636,6 +674,7 @@ static int wtb_session_cb(picoquic_cnx_t* cnx, uint8_t* bytes, size_t length,
                 else {
                     stream_ctx->path_callback = wtb_stream_cb;
                     stream_ctx->path_callback_ctx = st;
+                    wtb_take_flow_control(cnx, st);
                     if (s->accept_tail == NULL) {
                         s->accept_head = s->accept_tail = st;
                     }
@@ -862,6 +901,9 @@ static void wtb_process_ops(ngh_wtb_ctx* ctx)
                     hs->path_callback = wtb_stream_cb;
                     hs->path_callback_ctx = op->st;
                     op->st->hs = hs;
+                    if (op->st->bidi) {
+                        wtb_take_flow_control(op->s->cnx, op->st);
+                    }
                 }
             }
             break;
@@ -933,6 +975,7 @@ static void wtb_pump(ngh_wtb_ctx* ctx)
             (void)h3zero_set_datagram_ready(s->cnx, s->control_id);
         }
         for (st = s->streams; st != NULL; st = st->next) {
+            wtb_grant_credit(s->cnx, st);
             if (st->hs != NULL &&
                 (st->sendq.bytes > 0 ||
                     (st->finish_requested && !st->fin_sent))) {
@@ -1553,12 +1596,17 @@ int ngh_wtb_stream_finish(ngh_wtb_stream* st)
 int ngh_wtb_stream_read(ngh_wtb_stream* st, uint8_t* buf, size_t cap)
 {
     int ret;
+    int wake = 0;
     if (st == NULL || buf == NULL) {
         return NGH_WTB_ERR;
     }
     wtb_mutex_lock(&st->s->ctx->lock);
     if (st->recvq.head != NULL) {
         ret = (int)wtb_queue_read(&st->recvq, buf, cap);
+        st->read_since_grant += (size_t)ret;
+        /* let the network thread re-grant now rather than on its next tick */
+        wake = st->app_flow && (st->read_since_grant >= WTB_STREAM_RECV_REGRANT ||
+            st->recvq.bytes == 0);
     }
     else if (st->reset_received) {
         ret = NGH_WTB_ERR_RESET;
@@ -1570,6 +1618,9 @@ int ngh_wtb_stream_read(ngh_wtb_stream* st, uint8_t* buf, size_t cap)
         ret = 0;
     }
     wtb_mutex_unlock(&st->s->ctx->lock);
+    if (wake) {
+        wtb_wake(st->s->ctx);
+    }
     return ret;
 }
 
