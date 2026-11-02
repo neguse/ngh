@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Cross-stack interop test driver: starts the wtransport echo server
-(tests/wt-echo, Rust), waits for its certificate hash, then runs the echo
-client passed as argv[1] against it.
+(tests/wt-echo, Rust), waits for its certificate hash, then runs each
+client passed on the command line against it, in order.
 
-    python3 tests/wt_interop.py <path-to-ngh_wt_echo> [port]
+    python3 tests/wt_interop.py <client> [<client>...] [port]
 
-Exit code is the client's. Needs cargo; the first run compiles the server.
+Every client is called as `<client> <url> <cert_sha256_hex>`. Exit code is
+the first failing client's, else 0. Needs cargo; the first run compiles
+the server.
 """
 
 import re
@@ -18,11 +20,15 @@ PORT_DEFAULT = 4437
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: wt_interop.py <echo-client> [port]", file=sys.stderr)
+    args = sys.argv[1:]
+    port = str(PORT_DEFAULT)
+    if args and args[-1].isdigit():
+        port = args.pop()
+    clients = args
+    if not clients:
+        print("usage: wt_interop.py <client> [<client>...] [port]",
+              file=sys.stderr)
         return 2
-    client = sys.argv[1]
-    port = sys.argv[2] if len(sys.argv) > 2 else str(PORT_DEFAULT)
     src = Path(__file__).resolve().parent / "wt-echo"
 
     server = subprocess.Popen(
@@ -44,9 +50,14 @@ def main() -> int:
         if cert_hash is None:
             print("timed out waiting for the server", file=sys.stderr)
             return 1
-        return subprocess.run(
-            [client, f"https://localhost:{port}/", cert_hash],
-            timeout=60).returncode
+        for client in clients:
+            print(f"--- {client}", flush=True)
+            rc = subprocess.run(
+                [client, f"https://localhost:{port}/", cert_hash],
+                timeout=60).returncode
+            if rc != 0:
+                return rc
+        return 0
     finally:
         server.terminate()
         try:

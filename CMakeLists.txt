@@ -196,6 +196,9 @@ if(NGH_BUILD_TESTS)
         add_test(NAME test_wt COMMAND test_wt)
         set_tests_properties(test_wt PROPERTIES SKIP_RETURN_CODE 77)
 
+        # Stream backpressure against a live server; run by test_wt_interop.
+        ngh_add_program(test_wt_flow tests/test_wt_flow.c)
+
         # Slow name resolution must not stall the polling API. An
         # LD_PRELOAD shim makes every getaddrinfo() take 800ms; Linux only.
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -226,7 +229,8 @@ if(NGH_BUILD_TESTS)
             add_test(NAME test_wt_interop
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/wt_interop.py
-                             $<TARGET_FILE:ngh_wt_echo>)
+                             $<TARGET_FILE:ngh_wt_echo>
+                             $<TARGET_FILE:test_wt_flow>)
             set_tests_properties(test_wt_interop PROPERTIES TIMEOUT 700)
         endif()
 
