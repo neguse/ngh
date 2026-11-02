@@ -15,6 +15,8 @@ int main(void) {
     ngh_wt *wt;
 
     NGH_CHECK(ngh_wt_runtime_load(NULL) == 0);
+    ngh_wt_runtime_unload(); /* a no-op on the web */
+    NGH_CHECK(ngh_wt_runtime_load(NULL) == 0);
     NGH_CHECK(ngh_wt_connect(NULL, NULL) == NULL);
     NGH_CHECK(ngh_wt_last_error() != NULL);
     NGH_CHECK(ngh_wt_state(NULL) == NGH_WT_ERROR);

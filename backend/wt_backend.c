@@ -300,6 +300,8 @@ struct ngh_wtb_ctx {
     int loop_ready; /* the packet loop opened its sockets; under lock */
     struct wtb_resolver* resolvers; /* not yet joined; under lock */
     int closing;    /* ctx_destroy started: resolvers must not queue ops */
+    int stopping;   /* ctx_destroy asks the packet loop to end; under lock */
+    int loop_done;  /* the loop has returned for good; under lock */
     ptls_verify_certificate_t verifier;
     char err[256];
 };
@@ -1069,24 +1071,35 @@ static int wtb_loop_cb(picoquic_quic_t* quic,
         ctx->loop_ready = 1;
         wtb_mutex_unlock(&ctx->lock);
         break;
-    case picoquic_packet_loop_time_check: {
-        /* bound the sleep so timeouts and state polls stay responsive */
-        packet_loop_time_check_arg_t* tc = (packet_loop_time_check_arg_t*)callback_arg;
-        if (tc->delta_t > 250000) {
-            tc->delta_t = 250000;
+    case picoquic_packet_loop_time_check:
+    case picoquic_packet_loop_wake_up:
+    case picoquic_packet_loop_after_receive:
+    case picoquic_packet_loop_after_send: {
+        int stop;
+        if (cb_mode == picoquic_packet_loop_time_check) {
+            /* bound the sleep so timeouts and state polls stay responsive */
+            packet_loop_time_check_arg_t* tc =
+                (packet_loop_time_check_arg_t*)callback_arg;
+            if (tc->delta_t > 250000) {
+                tc->delta_t = 250000;
+            }
         }
         wtb_mutex_lock(&ctx->lock);
         wtb_pump(ctx);
+        stop = ctx->stopping;
+        if (stop) {
+            ctx->loop_done = 1;
+        }
         wtb_mutex_unlock(&ctx->lock);
+        if (stop) {
+            /* Leave the loop ourselves. picoquic_delete_network_thread would
+             * otherwise close the wake-up event while the thread waits on it
+             * (undefined on Windows, and it hard-kills a thread that does
+             * not exit within a second). */
+            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        }
         break;
     }
-    case picoquic_packet_loop_wake_up:
-    case picoquic_packet_loop_after_receive:
-    case picoquic_packet_loop_after_send:
-        wtb_mutex_lock(&ctx->lock);
-        wtb_pump(ctx);
-        wtb_mutex_unlock(&ctx->lock);
-        break;
     default:
         break;
     }
@@ -1214,8 +1227,22 @@ void ngh_wtb_ctx_destroy(ngh_wtb_ctx* ctx)
             wtb_op_push(ctx, WTB_OP_SESSION_CLOSE, s, NULL, 0, NULL);
         }
     }
+    ctx->stopping = 1;
     wtb_mutex_unlock(&ctx->lock);
     wtb_wake(ctx);
+    {
+        /* the loop ticks at least every 250ms, so this is bounded */
+        int done = 0;
+        unsigned waited;
+        for (waited = 0; !done && waited < 5000; waited++) {
+            wtb_mutex_lock(&ctx->lock);
+            done = ctx->loop_done;
+            wtb_mutex_unlock(&ctx->lock);
+            if (!done) {
+                wtb_sleep_ms(1);
+            }
+        }
+    }
 
     picoquic_delete_network_thread(ctx->net);
     ctx->net = NULL;
