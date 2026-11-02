@@ -26,7 +26,9 @@ Recorded so they don't get relitigated. Change only with a stated reason.
 - `accel` is a hint; report reality via `ngh_*_accel()`. Windows libmediapipe
   has no GPU path at all (upstream disables GPU for os:windows
   unconditionally). Measured: GPU loses to CPU on face landmarks even where
-  available; only pose full/heavy benefit. AUTO = CPU on desktop.
+  available; only pose full/heavy benefit. AUTO = CPU on desktop. A GPU
+  request that fails is retried on the CPU on every platform (the web always
+  did); creation fails only when the CPU fails too.
 - Web: never expose MediaPipe's `canvas` option (its auto-resize destroys the
   host app's canvas). Shared JS state lives in `globalThis.__NGH`; handles are
   plain ints because EM_JS bodies cannot share scope.
