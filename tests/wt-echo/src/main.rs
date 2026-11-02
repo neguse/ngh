@@ -6,6 +6,7 @@
 //! startup -- the client pins that hash, serverCertificateHashes-style.
 //! Echoes every datagram and every bidirectional stream of any session.
 
+use std::net::SocketAddr;
 use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
@@ -20,11 +21,23 @@ async fn main() -> anyhow::Result<()> {
     let hash = identity.certificate_chain().as_slice()[0].hash();
     let hex: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     println!("cert_sha256={hex}");
-    let config = ServerConfig::builder()
+    // Dual-stack [::] first; hosts without IPv6 (common in containers)
+    // refuse that socket outright, so fall back to IPv4 only.
+    let dual = ServerConfig::builder()
         .with_bind_default(port)
-        .with_identity(identity)
+        .with_identity(identity.clone_identity())
         .build();
-    let server = Endpoint::server(config)?;
+    let server = match Endpoint::server(dual) {
+        Ok(server) => server,
+        Err(e) => {
+            println!("wt-echo: dual-stack bind failed ({e}), using IPv4");
+            let v4 = ServerConfig::builder()
+                .with_bind_address(SocketAddr::from(([0, 0, 0, 0], port)))
+                .with_identity(identity)
+                .build();
+            Endpoint::server(v4)?
+        }
+    };
     println!("wt-echo listening on udp/{port}");
     for id in 0u64.. {
         let incoming = server.accept().await;
