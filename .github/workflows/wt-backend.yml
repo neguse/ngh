@@ -11,7 +11,7 @@ name: wt-backend
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     tags: ["wt-backend-v*"]
   pull_request:
   workflow_dispatch:
